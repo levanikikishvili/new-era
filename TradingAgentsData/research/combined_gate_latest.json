@@ -1,0 +1,116 @@
+{
+  "strategy": "new-era-kronos-matrix-v1",
+  "symbol": "XAUUSD",
+  "action": "SELL",
+  "confidence": 0.899,
+  "execution_allowed": false,
+  "real_account_allowed": false,
+  "reasons": [
+    "TradingAgents action is ABSTAIN",
+    "Kronos Matrix action is ABSTAIN"
+  ],
+  "inputs": {
+    "tradingagents": {
+      "version": "1",
+      "strategy": "new-era-gold-council-v1",
+      "symbol": "XAUUSD",
+      "action": "ABSTAIN",
+      "confidence": "0.0",
+      "generated_epoch": "1792486571",
+      "expires_epoch": "1792486871"
+    },
+    "kronos_matrix": {
+      "version": "1",
+      "strategy": "new-era-kronos-matrix-v1",
+      "symbol": "XAUUSD",
+      "action": "ABSTAIN",
+      "confidence": "0.7750",
+      "generated_epoch": "1792486599",
+      "expires_epoch": "1792486899"
+    }
+  },
+  "waterfall": {
+    "symbol": "XAUUSD",
+    "final_action": "SELL",
+    "win_probability_pct": 89.9,
+    "confidence": 0.899,
+    "risk_tier": "STANDARD_RISK (0.25% - 0.50%)",
+    "risk_pct": 0.5,
+    "recommended_lot": 0.01,
+    "sl_price": 4123.4,
+    "tp_price": 4105.88,
+    "be_trigger_price": 4112.45,
+    "partial_close_price": 4108.07,
+    "trailing_distance": 4.38,
+    "l2_wall_support": false,
+    "l2_vetoed": false,
+    "talib_vetoed": false,
+    "steps": {
+      "step1_talib": {
+        "symbol": "XAUUSD",
+        "passed": true,
+        "trend_bias": "SELL",
+        "filter_score": 72.4,
+        "close": 4120.06,
+        "rsi_14": 39.79,
+        "atr_14": 4.15312,
+        "ema_20": 4124.25578,
+        "ema_50": 4128.26781,
+        "ema_200": 4139.6806,
+        "macd_line": -2.28104,
+        "macd_signal": -2.35234,
+        "macd_hist": 0.07129,
+        "bb_upper": 4131.76842,
+        "bb_middle": 4124.338,
+        "bb_lower": 4116.90758,
+        "adx_14": 17.18,
+        "veto_buy": false,
+        "veto_sell": false,
+        "veto_reason": "",
+        "engine": "TA-Lib Native Quant Engine",
+        "summary": "[Step 1 TA-Lib] Bias=SELL | RSI(14)=39.8 | ATR(14)=4.15 | EMA20=4124.26 / EMA50=4128.27 / EMA200=4139.68 | MACD Hist=+0.0713 | ADX=17.2"
+      },
+      "step2_kronos_matrix": {
+        "candidate_direction": "SELL",
+        "strict_gate_action": "ABSTAIN",
+        "matrix_direction": "ABSTAIN",
+        "matrix_score": 5.0,
+        "buy_score": 0.0,
+        "sell_score": 5.0,
+        "analog_direction": "ABSTAIN",
+        "analog_win_rate_pct": 50.0,
+        "forecast_direction": "BUY",
+        "forecast_path_agreement_pct": 100.0,
+        "forecast_move_atr": 1.12
+      },
+      "step3_l2_safety": {
+        "l2_direction": "ABSTAIN",
+        "confluence_score_pct": 50.0,
+        "veto_buy": false,
+        "veto_sell": false,
+        "vetoed": false,
+        "l2_wall_support": false,
+        "veto_reason": ""
+      },
+      "step4_gemini_cio": {
+        "cio_agent": "ჯოი (Gemini Quant CIO)",
+        "final_action": "SELL",
+        "win_probability_pct": 89.9,
+        "risk_tier": "STANDARD_RISK (0.25% - 0.50%)",
+        "risk_pct": 0.5,
+        "risk_usd": 0.81,
+        "recommended_lot": 0.01,
+        "sl_price": 4123.4,
+        "tp_price": 4105.88,
+        "be_trigger_price": 4112.45,
+        "partial_close_price": 4108.07,
+        "trailing_distance": 4.38,
+        "autonomous_mode": true,
+        "rationale_ka": "🤖 ჯოი (Gemini Quant CIO): Waterfall იერარქია წარმატებით დადასტურდა -> SELL (XAUUSD) | Win-Probability: 89.9% | რისკის რეჟიმი: STANDARD_RISK (0.25% - 0.50%) (0.50% = $0.81) | რეკომენდებული ლოტი: 0.01 | SL: 4123.4 | TP: 4105.88 | Break-Even (+1x ATR): 4112.45 | 50% Partial Close (+2x ATR): 4108.07."
+      }
+    },
+    "rationale_ka": "🤖 ჯოი (Gemini Quant CIO): Waterfall იერარქია წარმატებით დადასტურდა -> SELL (XAUUSD) | Win-Probability: 89.9% | რისკის რეჟიმი: STANDARD_RISK (0.25% - 0.50%) (0.50% = $0.81) | რეკომენდებული ლოტი: 0.01 | SL: 4123.4 | TP: 4105.88 | Break-Even (+1x ATR): 4112.45 | 50% Partial Close (+2x ATR): 4108.07.",
+    "created_at": "2026-10-20T08:56:41.809296+00:00"
+  },
+  "scan_id": "1ae877a7-612b-450c-b990-8c9806ce45cb"
+}

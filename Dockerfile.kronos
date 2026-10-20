@@ -1,0 +1,25 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONPATH=/workspace/Kronos
+
+RUN useradd --create-home --uid 10001 appuser \
+    && install -d -m 0755 -o appuser -g appuser /home/appuser/.cache/huggingface
+
+WORKDIR /workspace
+
+# Install the CPU wheel explicitly.  The same image can be replaced by a CUDA
+# base later if a supported NVIDIA runtime is installed; the strategy contract
+# and fail-closed gate do not change.
+COPY Kronos/requirements.txt /tmp/kronos-requirements.txt
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu "torch>=2.0.0" \
+    && pip install --no-cache-dir -r /tmp/kronos-requirements.txt
+
+COPY Kronos /workspace/Kronos
+COPY kronos_matrix_strategy.py /workspace/kronos_matrix_strategy.py
+COPY run_kronos_matrix_research.py /workspace/run_kronos_matrix_research.py
+
+USER appuser
+ENTRYPOINT ["python", "/workspace/run_kronos_matrix_research.py"]

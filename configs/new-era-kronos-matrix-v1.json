@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "strategy_id": "new-era-kronos-matrix-v1",
+  "display_name": "New Era Kronos Matrix Scalper v1",
+  "status": "research_only",
+  "upstream": {
+    "repository": "https://github.com/shiyu-coder/Kronos",
+    "commit": "67b630e67f6a18c9e9be918d9b4337c960db1e9a",
+    "license": "MIT"
+  },
+  "hypothesis": "A closed M5 range breakout is more useful when H4/H1/M15 structure, historical analogues and a short Kronos path agree.",
+  "symbol": "XAUUSD",
+  "execution": {
+    "engine": "mt5_reusable_ea",
+    "expert_advisor": "NewEraCouncilDemo.mq5",
+    "preset": "NewEraKronosMatrixScalper.set",
+    "entry_timeframe": "M5",
+    "trend_timeframes": ["H4", "H1"],
+    "momentum_timeframe": "M15",
+    "maximum_open_positions": 1,
+    "maximum_trades_per_day": 3
+  },
+  "matrix": {
+    "minimum_score": 6,
+    "breakout_window": 20,
+    "breakout_atr_fraction": 0.10,
+    "requires_closed_m5_breakout": true
+  },
+  "historical_analog": {
+    "window_bars": 24,
+    "forward_horizon_bars": 12,
+    "neighbors": 8,
+    "minimum_samples": 5,
+    "minimum_direction_rate": 0.55,
+    "uses_future_bars_only_for_past_analogs": true
+  },
+  "kronos": {
+    "model": "NeoQuasar/Kronos-small",
+    "tokenizer": "NeoQuasar/Kronos-Tokenizer-base",
+    "lookback": 400,
+    "prediction_bars": 12,
+    "temperature": 0.7,
+    "top_p": 0.85,
+    "sample_count": 3,
+    "forecast_min_move_atr": 0.15,
+    "forecast_min_path_agreement": 0.67,
+    "direct_order_access": false
+  },
+  "cost_and_risk": {
+    "risk_percent": 0.25,
+    "maximum_risk_percent": 0.50,
+    "maximum_spread_points": 35.0,
+    "maximum_spread_to_atr": 0.08,
+    "reward_risk": 1.0,
+    "daily_loss_limit": 10.0,
+    "real_account_allowed": false
+  },
+  "promotion_rules": [
+    "No live order until the model has a point-in-time historical walk-forward report.",
+    "Kronos predictions must be generated at each historical decision time, never from future candles.",
+    "Include spread, commission, slippage and swap where available.",
+    "Compare matrix-only, Kronos-only, analog-only and combined ablations.",
+    "Require at least 4 weeks of broker-specific demo forward data before review."
+  ]
+}

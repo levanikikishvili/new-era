@@ -1,0 +1,85 @@
+{
+  "generated_epoch": 1792486599,
+  "expires_epoch": 1792486899,
+  "strategy": "new-era-kronos-matrix-v1",
+  "symbol": "XAUUSD",
+  "data_source": "/workspace/TradingAgentsData/market/xauusd_m5.csv",
+  "last_bar": "2026-10-20 11:50:00+00:00",
+  "model": "NeoQuasar/Kronos-small",
+  "tokenizer": "NeoQuasar/Kronos-Tokenizer-base",
+  "device": "cpu",
+  "lookback": 400,
+  "pred_len": 12,
+  "execution_allowed": false,
+  "real_account_allowed": false,
+  "action": "ABSTAIN",
+  "score": 7.0,
+  "confidence": 0.775,
+  "confidence_note": "heuristic confluence score, not a calibrated probability",
+  "decision": {
+    "strategy": "new-era-kronos-matrix-v1",
+    "action": "ABSTAIN",
+    "score": 7.0,
+    "confidence": 0.775,
+    "reasons": [
+      "H4: trend aligned bearish",
+      "H1: trend aligned bearish",
+      "M15: momentum aligned bearish",
+      "M5: no closed-bar range breakout",
+      "nearest analogs: 8",
+      "positive/negative rates: 0.50/0.50",
+      "forecast move=1.12 ATR",
+      "path agreement=1.00"
+    ],
+    "matrix": {
+      "direction": "ABSTAIN",
+      "score": 5.0,
+      "buy_score": 0.0,
+      "sell_score": 5.0,
+      "reasons": [
+        "H4: trend aligned bearish",
+        "H1: trend aligned bearish",
+        "M15: momentum aligned bearish",
+        "M5: no closed-bar range breakout"
+      ],
+      "metrics": {
+        "m15_ema": 4129.234131039989,
+        "m15_rsi": 38.27060350421807,
+        "m5_close": 4120.06,
+        "m5_atr": 4.379285714285808,
+        "m5_range_high": 4134.91,
+        "m5_range_low": 4118.09,
+        "m5_breakout_distance_atr": -3.390963953677833,
+        "m5_breakdown_distance_atr": -0.449845049747235
+      }
+    },
+    "analog": {
+      "direction": "ABSTAIN",
+      "sample_count": 8,
+      "win_rate": 0.5,
+      "median_forward_return": -0.00020932167408937996,
+      "p25_forward_return": -0.0015718138972345974,
+      "p75_forward_return": 0.000819154277258427,
+      "median_distance": 0.9176213781889659,
+      "reasons": [
+        "nearest analogs: 8",
+        "positive/negative rates: 0.50/0.50"
+      ]
+    },
+    "forecast": {
+      "direction": "BUY",
+      "move_atr": 1.117111044283036,
+      "final_return": 0.0011873973771012736,
+      "path_agreement": 1.0,
+      "forecast_bars": 12,
+      "reasons": [
+        "forecast move=1.12 ATR",
+        "path agreement=1.00"
+      ]
+    },
+    "hard_blocks": [
+      "matrix has no decisive breakout alignment",
+      "analog pattern has no sufficiently strong direction"
+    ]
+  }
+}

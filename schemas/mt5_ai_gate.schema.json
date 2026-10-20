@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "new-era/mt5-ai-gate-v1",
+  "title": "New Era MT5 AI Gate CSV contract",
+  "description": "The CSV header mirrors these fields. The gate is advisory and never authorizes a real account.",
+  "type": "object",
+  "required": [
+    "version",
+    "strategy",
+    "symbol",
+    "action",
+    "confidence",
+    "generated_epoch",
+    "expires_epoch"
+  ],
+  "properties": {
+    "version": { "const": "1" },
+    "strategy": { "type": "string", "minLength": 1 },
+    "symbol": { "type": "string", "minLength": 1 },
+    "action": { "enum": ["BUY", "SELL", "ABSTAIN"] },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "generated_epoch": { "type": "integer", "minimum": 1 },
+    "expires_epoch": { "type": "integer", "minimum": 1 }
+  }
+}

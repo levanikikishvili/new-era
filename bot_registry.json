@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "workspace_name": "New Era Trading Bot Lab",
+  "active_bot": "new-era-gold-council-v1",
+  "shared_rules": {
+    "real_account_allowed": false,
+    "execution_engine": "MT5",
+    "research_engine": "Python/Docker",
+    "new_bots_start_in": "research_only"
+  },
+  "bots": [
+    {
+      "id": "new-era-gold-council-v1",
+      "display_name": "New Era Gold Council v1",
+      "status": "demo_only",
+      "symbol": "XAUUSD",
+      "execution": {
+        "kind": "mt5_ea",
+        "source": "NewEraCouncilDemo.mq5",
+        "preset": "NewEraCouncilDemo.set",
+        "ai_gated_preset": "NewEraCouncilDemo_AI_Gated.set"
+      },
+      "research": {
+        "kind": "tradingagents_bridge",
+        "runner": "run_tradingagents_research.ps1",
+        "config": "configs/new-era-gold-council-v1.json",
+        "output_directory": "TradingAgentsData/research"
+      },
+      "charts": {
+        "tradingview_script": "NewEraCouncilDemo.pine"
+      },
+      "safety": {
+        "real_account_allowed": false,
+        "default_ai_gate": false,
+        "direct_python_orders": false
+      }
+    },
+    {
+      "id": "evidence-h1-fast-breakout-v220",
+      "display_name": "Evidence H1 Fast Breakout v2.20",
+      "status": "research_only",
+      "symbol": "XAUUSD",
+      "execution": {
+        "kind": "existing_mt5_package",
+        "source": "D:\\Documents\\new era\\evidence_h1_fast_breakout_package_20260803",
+        "preset": "D:\\Documents\\new era\\evidence_h1_fast_breakout_package_20260803\\EvidenceH1FastBreakout_R3_RECOMMENDED.set"
+      },
+      "safety": {
+        "real_account_allowed": false,
+        "direct_python_orders": false
+      }
+    },
+    {
+      "id": "xauusd-asia-research-candidate",
+      "display_name": "XAUUSD Asia filtered research candidate",
+      "status": "research_only",
+      "symbol": "XAUUSD",
+      "execution": {
+        "kind": "python_mt5_candidate",
+        "source": "D:\\Documents\\new era\\xauusd_asia_mt5_bot.py",
+        "launcher": "D:\\Documents\\new era\\start_xauusd_asia_guarded_demo.ps1"
+      },
+      "safety": {
+        "real_account_allowed": false,
+        "direct_python_orders": false
+      }
+    },
+    {
+      "id": "new-era-kronos-matrix-v1",
+      "display_name": "New Era Kronos Matrix Scalper v1",
+      "status": "research_only",
+      "symbol": "XAUUSD",
+      "execution": {
+        "kind": "mt5_reusable_ea",
+        "source": "NewEraCouncilDemo.mq5",
+        "preset": "NewEraKronosMatrixScalper.set",
+        "gate_file": "TradingAgentsData/research/new_era_kronos_matrix_gate.csv"
+      },
+      "research": {
+        "kind": "kronos_matrix_bridge",
+        "runner": "run_kronos_matrix_research.ps1",
+        "sync_runner": "sync_kronos_gate_to_mt5.ps1",
+        "config": "configs/new-era-kronos-matrix-v1.json",
+        "source": "Kronos",
+        "output_directory": "TradingAgentsData/research"
+      },
+      "safety": {
+        "real_account_allowed": false,
+        "default_ai_gate": true,
+        "direct_python_orders": false,
+        "status_before_validation": "research_only"
+      }
+    }
+  ],
+  "future_bot_contract": {
+    "required_fields": [
+      "id",
+      "display_name",
+      "status",
+      "symbol",
+      "execution",
+      "safety"
+    ],
+    "allowed_initial_statuses": [
+      "research_only",
+      "demo_only"
+    ],
+    "promotion_requires_user_authorization": true
+  }
+}

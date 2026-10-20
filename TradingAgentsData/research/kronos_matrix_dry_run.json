@@ -1,0 +1,11 @@
+{
+  "generated_epoch": 1792318945,
+  "strategy": "new-era-kronos-matrix-v1",
+  "symbol": "XAUUSD",
+  "action": "ABSTAIN",
+  "confidence": 0.0,
+  "execution_allowed": false,
+  "real_account_allowed": false,
+  "safe_failure": true,
+  "reason": "dry-run: no market data or Kronos dependency was loaded"
+}

@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "strategy_id": "new-era-gold-council-v1",
+  "display_name": "New Era Gold Council v1",
+  "status": "demo_only",
+  "symbol": "XAUUSD",
+  "execution": {
+    "engine": "mt5",
+    "expert_advisor": "NewEraCouncilDemo.mq5",
+    "entry_timeframe": "M5",
+    "trend_timeframes": ["H4", "H1"],
+    "momentum_timeframe": "M15",
+    "minimum_deterministic_votes": 4,
+    "max_open_positions": 1,
+    "max_trades_per_day": 2
+  },
+  "risk": {
+    "risk_percent": 0.5,
+    "maximum_risk_percent": 1.0,
+    "maximum_daily_loss_money": 10.0,
+    "maximum_consecutive_losses": 2,
+    "stop_loss_atr_multiplier": 1.5,
+    "reward_risk": 1.0,
+    "maximum_spread_points": 50.0
+  },
+  "ai_research": {
+    "engine": "tradingagents",
+    "analysts": ["market", "news", "social"],
+    "mode": "research_and_optional_gate",
+    "direct_order_access": false,
+    "default_gate_ttl_minutes": 90,
+    "gate_file_name": "new_era_ai_gate.csv"
+  },
+  "safety": {
+    "real_account_allowed": false,
+    "fail_closed_on_missing_ai_gate": true,
+    "demo_forward_test_weeks": 4,
+    "minimum_demo_weeks_before_review": 4
+  },
+  "promotion_rules": [
+    "No real account execution.",
+    "Validate the same rules in MT5 Strategy Tester and TradingView.",
+    "Include commission, spread, slippage and swap where available.",
+    "Keep a chronological holdout and a demo forward log.",
+    "Do not promote a bot because of full-sample profit alone."
+  ]
+}

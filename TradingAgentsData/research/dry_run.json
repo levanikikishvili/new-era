@@ -1,0 +1,19 @@
+{
+  "generated_at": "2026-10-17T07:49:06.876234+00:00",
+  "mode": "dry_run",
+  "framework": "TauricResearch TradingAgents",
+  "user_symbol": "XAUUSD",
+  "vendor_symbol": "GC=F",
+  "analysis_date": "2026-10-17",
+  "analysts": [
+    "market",
+    "news",
+    "social"
+  ],
+  "execution_allowed": false,
+  "real_account_allowed": false,
+  "consensus_action": "ABSTAIN",
+  "notes": [
+    "Dry run only; no data, LLM, MT5 terminal, or order was used."
+  ]
+}

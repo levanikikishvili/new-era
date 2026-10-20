@@ -1,0 +1,24 @@
+{
+  "generated_at": "2026-10-20T08:56:11.001790+00:00",
+  "generated_epoch": 1792486571,
+  "mode": "dry_run",
+  "framework": "TauricResearch TradingAgents",
+  "mt5_gate_strategy": "new-era-gold-council-v1",
+  "user_symbol": "XAUUSD",
+  "vendor_symbol": "GC=F",
+  "analysis_date": "2026-10-20",
+  "analysts": [
+    "market",
+    "news",
+    "social"
+  ],
+  "execution_allowed": false,
+  "real_account_allowed": false,
+  "consensus_action": "ABSTAIN",
+  "mt5_gate_action": "ABSTAIN",
+  "mt5_gate_confidence": 0.0,
+  "mt5_gate_expires_epoch": 1792486871,
+  "notes": [
+    "Dry run only; no data, LLM, MT5 terminal, or order was used."
+  ]
+}

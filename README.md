@@ -4,6 +4,20 @@ This repository contains the New Era research/demo trading workspace. The
 root service is a FastAPI backend; the existing PyQt6 desktop terminal and
 MetaTrader 5 bridge remain Windows-oriented integrations.
 
+The upstream research engines are pinned as Git submodules. Clone the full
+workspace with:
+
+```bash
+git clone --recurse-submodules <repository-url> NewEraTradingBot
+cd NewEraTradingBot
+```
+
+For an existing checkout, initialize them with:
+
+```bash
+git submodule update --init --recursive
+```
+
 The API is intentionally safe-mode/research-first. Keep provider credentials
 out of source control and pass them through the environment only when a
 research provider is required.
@@ -104,6 +118,10 @@ and the JSONL memory fallback; it does not provide the full desktop GUI, a
 Windows MT5 terminal connection, or ChromaDB persistence. Mount a host volume
 at `/app/TradingAgentsData` if API runtime data should survive container
 recreation.
+
+The downloaded model/cache directory `KronosData/` is intentionally ignored;
+recreate it with the Kronos research workflow when needed rather than putting
+large model artifacts in Git.
 
 For a deployment run using a private environment file, keep that file outside
 the image and outside Git:

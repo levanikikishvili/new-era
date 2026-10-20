@@ -1,0 +1,206 @@
+{
+  "symbol": "USTEC",
+  "source": "mt5_tick_volume_dom",
+  "timestamp": 1792491933.6217296,
+  "mid_price": 29414.9,
+  "best_bid": 29414.4,
+  "best_ask": 29415.4,
+  "spread": 1.0,
+  "total_bid_volume": 16906.93,
+  "total_ask_volume": 26669.8,
+  "imbalance_ratio": -0.224,
+  "bid_pressure_pct": 38.8,
+  "ask_pressure_pct": 61.2,
+  "l2_direction": "SELL",
+  "confluence_score": 61.2,
+  "nearest_buy_wall": null,
+  "nearest_sell_wall": null,
+  "veto_buy": true,
+  "veto_sell": false,
+  "veto_reason": "Heavy L2 Ask imbalance (61.2% Sell pressure)",
+  "bids": [
+    {
+      "price": 29414.4,
+      "volume": 2763.63,
+      "side": "BID",
+      "cumulative_volume": 2763.63,
+      "pct_of_side": 16.346137353144538,
+      "ratio_to_mean": 1.2683971468258401,
+      "tag": ""
+    },
+    {
+      "price": 29411.94,
+      "volume": 1925.92,
+      "side": "BID",
+      "cumulative_volume": 4689.55,
+      "pct_of_side": 11.391305222178124,
+      "ratio_to_mean": 0.8839213038702077,
+      "tag": ""
+    },
+    {
+      "price": 29409.48,
+      "volume": 3027.09,
+      "side": "BID",
+      "cumulative_volume": 7716.64,
+      "pct_of_side": 17.90443327085402,
+      "ratio_to_mean": 1.3893148935222994,
+      "tag": ""
+    },
+    {
+      "price": 29407.02,
+      "volume": 776.95,
+      "side": "BID",
+      "cumulative_volume": 8493.59,
+      "pct_of_side": 4.595452870509312,
+      "ratio_to_mean": 0.35658939989301625,
+      "tag": ""
+    },
+    {
+      "price": 29404.56,
+      "volume": 1454.42,
+      "side": "BID",
+      "cumulative_volume": 9948.01,
+      "pct_of_side": 8.602507965668515,
+      "ratio_to_mean": 0.6675214041989841,
+      "tag": ""
+    },
+    {
+      "price": 29402.1,
+      "volume": 1802.07,
+      "side": "BID",
+      "cumulative_volume": 11750.08,
+      "pct_of_side": 10.658765370176608,
+      "ratio_to_mean": 0.8270790396617643,
+      "tag": ""
+    },
+    {
+      "price": 29399.64,
+      "volume": 1501.21,
+      "side": "BID",
+      "cumulative_volume": 13251.29,
+      "pct_of_side": 8.879258386945471,
+      "ratio_to_mean": 0.688996168367842,
+      "tag": ""
+    },
+    {
+      "price": 29397.18,
+      "volume": 1649.69,
+      "side": "BID",
+      "cumulative_volume": 14900.980000000001,
+      "pct_of_side": 9.757478146535178,
+      "ratio_to_mean": 0.7571426309408713,
+      "tag": ""
+    },
+    {
+      "price": 29394.72,
+      "volume": 1350.35,
+      "side": "BID",
+      "cumulative_volume": 16251.330000000002,
+      "pct_of_side": 7.98696155954984,
+      "ratio_to_mean": 0.6197573796840652,
+      "tag": ""
+    },
+    {
+      "price": 29392.26,
+      "volume": 655.6,
+      "side": "BID",
+      "cumulative_volume": 16906.93,
+      "pct_of_side": 3.877699854438387,
+      "ratio_to_mean": 0.3008945370614087,
+      "tag": ""
+    }
+  ],
+  "asks": [
+    {
+      "price": 29415.4,
+      "volume": 2309.48,
+      "side": "ASK",
+      "cumulative_volume": 2309.48,
+      "pct_of_side": 8.659532504930672,
+      "ratio_to_mean": 1.0599602127098566,
+      "tag": ""
+    },
+    {
+      "price": 29417.86,
+      "volume": 3394.83,
+      "side": "ASK",
+      "cumulative_volume": 5704.3099999999995,
+      "pct_of_side": 12.729116828772618,
+      "ratio_to_mean": 1.5580930464493317,
+      "tag": ""
+    },
+    {
+      "price": 29420.32,
+      "volume": 2868.27,
+      "side": "ASK",
+      "cumulative_volume": 8572.58,
+      "pct_of_side": 10.754748817014,
+      "ratio_to_mean": 1.3164227788546774,
+      "tag": ""
+    },
+    {
+      "price": 29422.78,
+      "volume": 2997.18,
+      "side": "ASK",
+      "cumulative_volume": 11569.76,
+      "pct_of_side": 11.23810452271858,
+      "ratio_to_mean": 1.3755873834498364,
+      "tag": ""
+    },
+    {
+      "price": 29425.24,
+      "volume": 2397.99,
+      "side": "ASK",
+      "cumulative_volume": 13967.75,
+      "pct_of_side": 8.991406009793849,
+      "ratio_to_mean": 1.1005828110553497,
+      "tag": ""
+    },
+    {
+      "price": 29427.7,
+      "volume": 1138.29,
+      "side": "ASK",
+      "cumulative_volume": 15106.04,
+      "pct_of_side": 4.268085999895012,
+      "ratio_to_mean": 0.522430205295349,
+      "tag": ""
+    },
+    {
+      "price": 29430.16,
+      "volume": 3392.02,
+      "side": "ASK",
+      "cumulative_volume": 18498.06,
+      "pct_of_side": 12.718580566783402,
+      "ratio_to_mean": 1.5568033673017683,
+      "tag": ""
+    },
+    {
+      "price": 29432.62,
+      "volume": 3241.02,
+      "side": "ASK",
+      "cumulative_volume": 21739.08,
+      "pct_of_side": 12.152397093341532,
+      "ratio_to_mean": 1.4875003241408886,
+      "tag": ""
+    },
+    {
+      "price": 29435.08,
+      "volume": 2748.76,
+      "side": "ASK",
+      "cumulative_volume": 24487.840000000004,
+      "pct_of_side": 10.306638969921035,
+      "ratio_to_mean": 1.261572403436421,
+      "tag": ""
+    },
+    {
+      "price": 29437.54,
+      "volume": 2181.96,
+      "side": "ASK",
+      "cumulative_volume": 26669.800000000003,
+      "pct_of_side": 8.181388686829298,
+      "ratio_to_mean": 1.0014335632802185,
+      "tag": ""
+    }
+  ],
+  "alerts": []
+}

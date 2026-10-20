@@ -1,0 +1,111 @@
+//@version=6
+strategy(
+     "New Era Council — XAUUSD M5 demo research",
+     overlay = true,
+     pyramiding = 0,
+     initial_capital = 1000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 0.5,
+     commission_type = strategy.commission.cash_per_order,
+     commission_value = 5.5,
+     process_orders_on_close = true,
+     calc_on_order_fills = true)
+
+// This Pine strategy mirrors the direct MT5 EA's deterministic council votes.
+// It is for TradingView research/alerts only; it does not connect to MT5.
+// Set commission/slippage in Strategy Properties to match your broker.
+
+groupRisk = "Risk / execution"
+rr = input.float(1.0, "Reward : risk", minval = 0.25, step = 0.25, group = groupRisk)
+slAtr = input.float(1.5, "Stop ATR multiplier", minval = 0.25, step = 0.25, group = groupRisk)
+beR = input.float(0.8, "Break-even at R", minval = 0.25, step = 0.05, group = groupRisk)
+maxHoldBars = input.int(18, "Maximum losing hold bars", minval = 1, group = groupRisk)
+spreadPoints = input.float(40.0, "Estimated spread points", minval = 0.0, step = 1.0, group = groupRisk)
+slippagePoints = input.float(10.0, "Estimated slippage points / side", minval = 0.0, step = 1.0, group = groupRisk)
+
+groupVotes = "Council votes"
+minVotes = input.int(4, "Minimum directional votes", minval = 2, maxval = 4, group = groupVotes)
+breakoutLookback = input.int(20, "M5 breakout lookback", minval = 5, group = groupVotes)
+buyRsiMin = input.float(52.0, "Buy RSI minimum", minval = 50.0, maxval = 70.0, group = groupVotes)
+sellRsiMax = input.float(48.0, "Sell RSI maximum", minval = 30.0, maxval = 50.0, group = groupVotes)
+minAtrRatio = input.float(0.50, "Minimum ATR regime ratio", minval = 0.1, step = 0.05, group = groupVotes)
+maxAtrRatio = input.float(2.00, "Maximum ATR regime ratio", minval = 0.5, step = 0.1, group = groupVotes)
+
+// Higher-timeframe values use confirmed bars only to avoid look-ahead.
+[h4Close, h4Fast, h4Slow] = request.security(syminfo.tickerid, "240", [close[1], ta.ema(close, 50)[1], ta.ema(close, 200)[1]], lookahead = barmerge.lookahead_off)
+[h1Close, h1Fast] = request.security(syminfo.tickerid, "60", [close[1], ta.ema(close, 20)[1]], lookahead = barmerge.lookahead_off)
+[m15Close, m15Ema, m15Rsi] = request.security(syminfo.tickerid, "15", [close[1], ta.ema(close, 20)[1], ta.rsi(close, 14)[1]], lookahead = barmerge.lookahead_off)
+
+m5Atr = ta.atr(14)
+atrAverage = ta.sma(m5Atr, 200)
+atrRatio = atrAverage > 0 ? m5Atr / atrAverage : na
+regimeOk = not na(atrRatio) and atrRatio >= minAtrRatio and atrRatio <= maxAtrRatio
+
+rangeHigh = ta.highest(high[1], breakoutLookback)
+rangeLow = ta.lowest(low[1], breakoutLookback)
+buyBreakout = close > rangeHigh
+sellBreakout = close < rangeLow
+
+buyVotes = (h4Close > h4Fast and h4Fast > h4Slow ? 1 : 0) +
+     (h1Close > h1Fast ? 1 : 0) +
+     (m15Close > m15Ema and m15Rsi >= buyRsiMin ? 1 : 0) +
+     (buyBreakout ? 1 : 0)
+sellVotes = (h4Close < h4Fast and h4Fast < h4Slow ? 1 : 0) +
+     (h1Close < h1Fast ? 1 : 0) +
+     (m15Close < m15Ema and m15Rsi <= sellRsiMax ? 1 : 0) +
+     (sellBreakout ? 1 : 0)
+
+// Pine cannot know a broker's exact point value. These checks make the
+// assumption visible and block obviously expensive conditions.
+estimatedCostPoints = spreadPoints + slippagePoints * 2.0
+costOk = estimatedCostPoints <= math.max(1.0, m5Atr / syminfo.mintick * 0.08)
+
+longSignal = barstate.isconfirmed and regimeOk and costOk and strategy.position_size == 0 and buyVotes >= minVotes and buyVotes > sellVotes
+shortSignal = barstate.isconfirmed and regimeOk and costOk and strategy.position_size == 0 and sellVotes >= minVotes and sellVotes > buyVotes
+
+var float plannedRisk = na
+var float plannedStop = na
+var float plannedTarget = na
+var int entryBar = na
+
+if longSignal
+    plannedRisk := m5Atr * slAtr
+    plannedStop := close - plannedRisk
+    plannedTarget := close + plannedRisk * rr
+    entryBar := bar_index
+    strategy.entry("Council Long", strategy.long, comment = "4-vote council BUY")
+
+if shortSignal
+    plannedRisk := m5Atr * slAtr
+    plannedStop := close + plannedRisk
+    plannedTarget := close - plannedRisk * rr
+    entryBar := bar_index
+    strategy.entry("Council Short", strategy.short, comment = "4-vote council SELL")
+
+if strategy.position_size > 0 and not na(plannedRisk)
+    profitR = (close - strategy.position_avg_price) / plannedRisk
+    stopNow = profitR >= beR ? math.max(plannedStop, strategy.position_avg_price) : plannedStop
+    strategy.exit("Council Long Exit", "Council Long", stop = stopNow, limit = plannedTarget)
+    if not na(entryBar) and bar_index - entryBar >= maxHoldBars and profitR < 0
+        strategy.close("Council Long", comment = "losing time guard")
+
+if strategy.position_size < 0 and not na(plannedRisk)
+    profitR = (strategy.position_avg_price - close) / plannedRisk
+    stopNow = profitR >= beR ? math.min(plannedStop, strategy.position_avg_price) : plannedStop
+    strategy.exit("Council Short Exit", "Council Short", stop = stopNow, limit = plannedTarget)
+    if not na(entryBar) and bar_index - entryBar >= maxHoldBars and profitR < 0
+        strategy.close("Council Short", comment = "losing time guard")
+
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    plannedRisk := na
+    plannedStop := na
+    plannedTarget := na
+    entryBar := na
+
+plot(atrRatio, "ATR regime ratio", color = color.new(color.orange, 0), display = display.data_window)
+plotshape(longSignal, title = "Council BUY", style = shape.triangleup, location = location.belowbar, color = color.lime, size = size.tiny, text = "BUY")
+plotshape(shortSignal, title = "Council SELL", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.tiny, text = "SELL")
+bgcolor(not costOk ? color.new(color.red, 88) : na, title = "Cost blocked")
+
+alertcondition(longSignal, "New Era Council BUY", "New Era Council BUY on {{ticker}}")
+alertcondition(shortSignal, "New Era Council SELL", "New Era Council SELL on {{ticker}}")
