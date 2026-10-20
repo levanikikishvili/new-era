@@ -1,0 +1,10 @@
+# Linux API-only dependency set for Docker.
+# The desktop PyQt6 packages, Windows-only MetaTrader5 bridge, and optional
+# ChromaDB backend are intentionally omitted; MemoryStore falls back to JSONL.
+-c requirements_api.lock.txt
+
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+pydantic>=2.8,<3
+requests>=2.31,<3
+websockets>=12.0,<18

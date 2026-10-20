@@ -1,0 +1,11 @@
+TradingAgents/.git
+Kronos/.git
+TradingAgentsData/*
+KronosData/*
+__pycache__/
+*.pyc
+*.ex5
+.env
+**/.env
+.venv/
+.venv-*/

@@ -1,0 +1,38 @@
+# Local secrets and environment files. Keep example files trackable.
+.env
+**/.env
+!.env.example
+!**/.env.example
+*.secret
+
+# Python bytecode, caches, and local environments.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+.venv-*/
+venv/
+env/
+
+# Local runtime state and logs.
+chroma_db/
+TradingAgentsData/memory/
+KronosData/hf-cache/
+*.log
+*.pid
+
+# Build and packaging output.
+build/
+dist/
+*.egg-info/
+
+# Editor and operating-system files.
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
