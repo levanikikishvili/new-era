@@ -1,6 +1,8 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from kronos_matrix_strategy import STRATEGY_ID
 from newera_api.config import ApiSettings
@@ -41,6 +43,48 @@ class NewEraApiCoreTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 config.resolve_workspace_path("..\\outside.csv")
             self.assertEqual(orchestrator._line_event_type("kronos", "forecast: BUY"), "kronos.forecast")
+
+    def test_demo_execution_event_labels_local_paper_overlay(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = ApiSettings(root=root, memory_dir=root / "memory", report_dir=root / "reports")
+            orchestrator = Orchestrator(config)
+            payload = {
+                "ok": True,
+                "execution_source": "mt5_demo_paper_fallback",
+                "demo_overlay": True,
+                "paper_fallback": True,
+                "position": {
+                    "ticket": 1001,
+                    "symbol": "XAUUSD",
+                    "side": "BUY",
+                    "volume": 0.01,
+                    "price_open": 100.1,
+                    "sl": 99.0,
+                    "tp": 101.0,
+                    "risk_usd": 11.0,
+                    "reward_usd": 9.0,
+                },
+            }
+            with (
+                patch("newera_api.orchestrator.execute_mt5_demo_order", return_value=payload),
+                patch.object(orchestrator.bus, "publish", new_callable=AsyncMock) as publish,
+                patch.object(orchestrator.telegram, "notify_trade_opened", new_callable=AsyncMock),
+            ):
+                result = asyncio.run(
+                    orchestrator.execute_demo_trade(
+                        symbol="XAUUSD",
+                        side="BUY",
+                        volume=0.01,
+                        sl=99.0,
+                        tp=101.0,
+                    )
+                )
+
+            self.assertTrue(result["paper_fallback"])
+            published = publish.await_args.args[0]
+            self.assertTrue(published["payload"]["demo_overlay"])
+            self.assertIn("[LOCAL PAPER OVERLAY]", published["payload"]["message"])
 
 
 if __name__ == "__main__":
