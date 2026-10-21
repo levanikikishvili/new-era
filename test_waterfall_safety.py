@@ -4,11 +4,16 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 from newera_api.config import ApiSettings
 from newera_api.gemini_manager import GeminiPortfolioManager, Step1TALibResult, TALibTechnicalEngine
-from newera_api.orchestrator import Orchestrator
+from newera_api.orchestrator import (
+    Orchestrator,
+    build_joey_profile_comment,
+    is_joey_live_auto_execution_symbol,
+)
 
 
 def step1_fixture() -> Step1TALibResult:
@@ -60,14 +65,27 @@ def kronos_fixture(
     generated_epoch: int | None = None,
     expires_epoch: int | None = None,
 ) -> dict[str, object]:
+    matrix_score = 6.5 if matrix in {"BUY", "SELL"} else 0.0
+    buy_score = matrix_score if matrix == "BUY" else 0.0
+    sell_score = matrix_score if matrix == "SELL" else 0.0
+    forecast_move_atr = 1.45 if forecast == "BUY" else -1.45 if forecast == "SELL" else 0.0
     report: dict[str, object] = {
         "symbol": symbol,
         "action": matrix if matrix == analogue == forecast else "ABSTAIN",
         "confidence": 0.9,
         "decision": {
-            "matrix": {"direction": matrix, "score": 6.5, "buy_score": 6.5, "sell_score": 1.0},
+            "matrix": {
+                "direction": matrix,
+                "score": matrix_score,
+                "buy_score": buy_score,
+                "sell_score": sell_score,
+            },
             "analog": {"direction": analogue, "win_rate": 0.875},
-            "forecast": {"direction": forecast, "move_atr": 1.45, "path_agreement": 0.85},
+            "forecast": {
+                "direction": forecast,
+                "move_atr": forecast_move_atr,
+                "path_agreement": 0.85,
+            },
             "hard_blocks": [],
         },
     }
@@ -139,6 +157,62 @@ class WaterfallSafetyTests(unittest.TestCase):
         self.assertEqual(decision.recommended_lot, 0.0)
         self.assertFalse(decision.step2_kronos_matrix["components_agree"])
 
+    def test_step2_accepts_two_of_three_qualified_votes(self):
+        decision = self.evaluate(
+            kronos_fixture(matrix="BUY", analogue="BUY", forecast="SELL")
+        )
+
+        self.assertEqual(decision.final_action, "BUY")
+        self.assertEqual(decision.step2_kronos_matrix["selected_direction"], "BUY")
+        self.assertEqual(decision.step2_kronos_matrix["confluence_count"], 2)
+        self.assertEqual(decision.step2_kronos_matrix["confluence_label"], "2-of-3")
+        self.assertEqual(
+            decision.step2_kronos_matrix["supporting_components"],
+            ["Matrix", "Analogue"],
+        )
+        self.assertTrue(decision.step2_kronos_matrix["components_agree"])
+
+    def test_step2_rejects_direction_contradicted_by_talib_trend(self):
+        decision = self.evaluate(
+            kronos_fixture(matrix="SELL", analogue="SELL", forecast="BUY")
+        )
+
+        self.assertEqual(decision.final_action, "ABSTAIN")
+        self.assertEqual(decision.recommended_lot, 0.0)
+        self.assertEqual(decision.step2_kronos_matrix["selected_direction"], "SELL")
+        self.assertEqual(decision.step2_kronos_matrix["confluence_count"], 2)
+        self.assertEqual(decision.step2_kronos_matrix["confluence_label"], "2-of-3")
+        self.assertTrue(decision.step2_kronos_matrix["talib_trend_contradiction"])
+        self.assertTrue(decision.talib_vetoed)
+        self.assertFalse(decision.step2_kronos_matrix["components_agree"])
+
+    def test_joey_risk_profile_caps_risk_reward_and_stop_distance(self):
+        sizing = self.manager.compute_dynamic_risk_and_lot(
+            99.0,
+            l2_wall_support=True,
+            equity=10000.0,
+            atr=2.0,
+            sl_atr_mult=4.0,
+            tp_atr_mult=1.0,
+            entry_price=100.0,
+            side="BUY",
+            digits=2,
+            point=0.01,
+            tick_value=1.0,
+            tick_size=0.01,
+            volume_min=0.01,
+            volume_max=50.0,
+            volume_step=0.01,
+        )
+
+        self.assertEqual(sizing["action"], "BUY")
+        self.assertLessEqual(sizing["risk_pct"], 1.5)
+        self.assertLessEqual(sizing["realized_risk_pct"], 1.5)
+        self.assertLessEqual(sizing["sl_atr_multiple"], 2.5)
+        self.assertLessEqual(sizing["sl_distance"], 2.5 * 2.0)
+        self.assertGreaterEqual(sizing["reward_risk_ratio"], 1.5)
+        self.assertGreaterEqual(sizing["tp_distance"], sizing["sl_distance"] * 1.5)
+
     def test_expired_or_symbol_mismatched_report_abstains(self):
         now = int(time.time())
         cases = (
@@ -198,7 +272,7 @@ class WaterfallSafetyTests(unittest.TestCase):
         self.assertFalse(decision.research_evidence_valid)
 
     def test_screener_does_not_share_one_symbol_report_with_another_pair(self):
-        async def run_cycle() -> dict[str, object]:
+        async def run_cycle() -> dict[str, Any]:
             now = int(time.time())
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -241,6 +315,62 @@ class WaterfallSafetyTests(unittest.TestCase):
         self.assertEqual(results["XAUUSD"]["final_action"], "BUY")
         self.assertEqual(results["EURUSD"]["final_action"], "ABSTAIN")
         self.assertEqual(payload["auto_executed_count"], 0)
+
+    def test_joey_allowlist_routes_non_core_auto_signal_to_shadow_mode(self):
+        async def run_cycle() -> tuple[dict[str, Any], AsyncMock, AsyncMock]:
+            now = int(time.time())
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                settings = ApiSettings(root=root, memory_dir=root / "memory", report_dir=root / "reports")
+                orchestrator = Orchestrator(settings)
+                orchestrator.screener_symbols = ["EURUSD"]
+                orchestrator.gemini_cio.autonomous_mode = True
+                orchestrator.get_open_positions = AsyncMock(return_value={"positions": []})
+                orchestrator.MarketBookGet = AsyncMock(return_value=l2_fixture())
+                settings.report_dir.joinpath("kronos_matrix_latest.json").write_text(
+                    json.dumps(kronos_fixture(symbol="EURUSD", generated_epoch=now, expires_epoch=now + 300)),
+                    encoding="utf-8",
+                )
+                settings.report_dir.joinpath("tradingagents_latest.json").write_text(
+                    json.dumps(
+                        {
+                            "user_symbol": "EURUSD",
+                            "ai_action": "BUY",
+                            "generated_epoch": now,
+                            "mt5_gate_expires_epoch": now + 300,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                mt5_meta = {
+                    "last_close": 100.0,
+                    "bid": 100.0,
+                    "ask": 100.1,
+                    "atr_m5": 1.0,
+                }
+                execute = AsyncMock()
+                final_review = AsyncMock(side_effect=AssertionError("shadow mode must not call live Gemini execution review"))
+                with (
+                    patch("newera_api.orchestrator.get_mt5_status", return_value={"account": {"equity": 1000.0}}),
+                    patch("newera_api.orchestrator.fetch_mt5_bars_to_csv", return_value=mt5_meta),
+                    patch.object(TALibTechnicalEngine, "evaluate_from_csv", return_value=step1_fixture()),
+                    patch.object(orchestrator, "execute_demo_trade", new=execute),
+                    patch.object(orchestrator, "_gemini_gate_before_auto_trade", new=final_review),
+                ):
+                    payload = await orchestrator.run_multi_pair_screener_cycle()
+                return payload, execute, final_review
+
+        payload, execute, final_review = asyncio.run(run_cycle())
+        self.assertTrue(is_joey_live_auto_execution_symbol("XAUUSD"))
+        self.assertFalse(is_joey_live_auto_execution_symbol("EURUSD"))
+        self.assertEqual(build_joey_profile_comment("USTEC", {"confluence_count": 2}), "JoeyCIO_USTEC_2of3")
+        self.assertEqual(payload["auto_executed_count"], 0)
+        self.assertEqual(payload["shadow_logged_count"], 1)
+        self.assertEqual(payload["results"][0]["execution_mode"], "SHADOW")
+        self.assertFalse(payload["results"][0]["auto_execution_allowed"])
+        self.assertEqual(payload["shadow_trades"][0]["comment"], "JoeyCIO_EURUSD_3of3")
+        execute.assert_not_awaited()
+        final_review.assert_not_awaited()
 
 
 if __name__ == "__main__":

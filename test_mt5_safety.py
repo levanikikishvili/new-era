@@ -2,7 +2,7 @@ import json
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -52,7 +52,20 @@ class FakeMetaTrader5:
         return "fake mt5 error"
 
     def account_info(self) -> object:
-        return SimpleNamespace(login=12345, trade_mode=self.trade_mode)
+        return SimpleNamespace(
+            login=12345,
+            trade_mode=self.trade_mode,
+            balance=10000.0,
+            equity=10000.0,
+            profit=0.0,
+            margin=0.0,
+            margin_free=10000.0,
+            leverage=100,
+            company="Fake Broker",
+            server="Fake Demo",
+            name="Fake Account",
+            currency="USD",
+        )
 
     def symbols_get(self) -> list[object]:
         return [SimpleNamespace(name="XAUUSD")]
@@ -84,7 +97,16 @@ class FakeMetaTrader5:
         return list(self.history)
 
     def copy_rates_from_pos(self, symbol: str, timeframe: int, start: int, count: int) -> list[object]:
-        return []
+        return [
+            {
+                "time": 1_700_000_000 + i * 300,
+                "open": 100.0,
+                "high": 100.5,
+                "low": 99.5,
+                "close": 100.0,
+            }
+            for i in range(max(16, count))
+        ]
 
     def order_send(self, request: dict[str, object]) -> object:
         self.order_send_calls.append(request)
@@ -98,13 +120,18 @@ class FakeMetaTrader5:
 
 
 class Mt5SafetyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        mt5_bridge.clear_execution_locks()
+
     def _call_bridge(
         self,
         fake_mt5: FakeMetaTrader5,
         *,
+        symbol: str = "XAUUSD",
         side: str = "BUY",
         sl: float = 99.0,
-        tp: float = 101.0,
+        tp: float = 103.0,
+        comment: str = "NewEraQuantDemo",
         allow_paper_fallback: bool = False,
     ) -> object:
         with tempfile.TemporaryDirectory() as directory:
@@ -117,17 +144,19 @@ class Mt5SafetyTests(unittest.TestCase):
                     "os.environ",
                     {
                         "NEWERA_MAX_OPEN_POSITIONS_PER_SYMBOL": "1",
+                        "NEWERA_MAX_OPEN_POSITIONS_ACCOUNT": "2",
                         "NEWERA_MAX_DAILY_DEMO_TRADES": "10",
                     },
                     clear=False,
                 ),
-            ):
+                ):
                 return mt5_bridge._inprocess_execute_demo_order(
-                    "XAUUSD",
+                    symbol,
                     side,
                     0.01,
                     sl=sl,
                     tp=tp,
+                    comment=comment,
                     allow_paper_fallback=allow_paper_fallback,
                 )
 
@@ -149,6 +178,18 @@ class Mt5SafetyTests(unittest.TestCase):
                     )
                 self.assertEqual(fake_mt5.order_send_calls, [])
                 self.assertEqual(fake_mt5.positions_calls, 0)
+
+    def test_bridge_enforces_joey_risk_reward_and_atr_limits_before_order_send(self) -> None:
+        cases = (
+            (99.0, 101.0, "reward:risk"),
+            (96.0, 110.0, "SL distance"),
+        )
+        for sl, tp, message in cases:
+            with self.subTest(sl=sl, tp=tp):
+                fake_mt5 = FakeMetaTrader5()
+                with self.assertRaisesRegex(ValueError, message):
+                    self._call_bridge(fake_mt5, sl=sl, tp=tp)
+                self.assertEqual(fake_mt5.order_send_calls, [])
 
     def test_duplicate_symbol_guard_includes_paper_positions(self) -> None:
         fake_mt5 = FakeMetaTrader5()
@@ -186,10 +227,107 @@ class Mt5SafetyTests(unittest.TestCase):
                         "BUY",
                         0.01,
                         sl=99.0,
-                        tp=101.0,
+                        tp=103.0,
                         allow_paper_fallback=True,
                     )
         self.assertEqual(fake_mt5.order_send_calls, [])
+
+    def test_account_wide_cap_blocks_a_new_symbol(self) -> None:
+        fake_mt5 = FakeMetaTrader5(
+            positions=[
+                SimpleNamespace(symbol="XAUUSD"),
+                SimpleNamespace(symbol="EURUSD"),
+            ]
+        )
+        with self.assertRaisesRegex(RuntimeError, "account-wide open-position cap"):
+            self._call_bridge(fake_mt5, symbol="GBPUSD")
+        self.assertEqual(fake_mt5.order_send_calls, [])
+
+    def test_pure_safety_helpers_are_deterministic(self) -> None:
+        lock_state: dict[str, float] = {}
+        self.assertEqual(
+            mt5_bridge.acquire_execution_lock(
+                lock_state,
+                "xauusd",
+                now=100.0,
+                lock_seconds=60.0,
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            mt5_bridge.execution_lock_remaining(
+                lock_state,
+                "XAUUSD",
+                now=101.5,
+                lock_seconds=60.0,
+            ),
+            58.5,
+        )
+        self.assertEqual(
+            mt5_bridge.count_open_positions_account_wide([{"symbol": "XAUUSD"}], [{"symbol": "EURUSD"}]),
+            2,
+        )
+        opened = datetime(2026, 1, 2, 10, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 1, 2, 12, 0, tzinfo=timezone.utc)
+        self.assertEqual(mt5_bridge.position_age_minutes({"opened_at": opened}, now=now), 120.0)
+        self.assertTrue(mt5_bridge.is_position_time_stop_due({"opened_at": opened}, now=now))
+        self.assertEqual(mt5_bridge.prepare_order_comment("x" * 40), "x" * 31)
+
+    def test_per_symbol_execution_lock_covers_check_and_send(self) -> None:
+        fake_mt5 = FakeMetaTrader5(order_retcode=FakeMetaTrader5.TRADE_RETCODE_DONE)
+        first = self._call_bridge(fake_mt5, comment="JoeyCIO_88pct")
+        self.assertIsInstance(first, dict)
+        with self.assertRaisesRegex(RuntimeError, "execution lock is active"):
+            self._call_bridge(fake_mt5, comment="JoeyCIO_88pct")
+        self.assertEqual(len(fake_mt5.order_send_calls), 1)
+        self.assertEqual(fake_mt5.positions_calls, 1)
+
+    def test_order_comment_is_passed_through_and_returned_for_profiling(self) -> None:
+        fake_mt5 = FakeMetaTrader5(order_retcode=FakeMetaTrader5.TRADE_RETCODE_DONE)
+        result = self._call_bridge(fake_mt5, comment="JoeyCIO_91pct")
+        assert isinstance(result, dict)
+        self.assertEqual(fake_mt5.order_send_calls[0]["comment"], "JoeyCIO_91pct")
+        self.assertEqual(result["order_comment"], "JoeyCIO_91pct")
+        self.assertEqual(result["position"]["comment"], "JoeyCIO_91pct")
+
+    def test_time_stop_closes_old_terminal_position_before_dynamic_management(self) -> None:
+        now = datetime(2026, 1, 2, 12, 0, tzinfo=timezone.utc)
+        old_position = SimpleNamespace(
+            ticket=77,
+            symbol="XAUUSD",
+            type=FakeMetaTrader5.ORDER_TYPE_BUY,
+            volume=0.10,
+            price_open=100.0,
+            price_current=100.1,
+            sl=99.0,
+            tp=101.0,
+            profit=1.0,
+            swap=0.0,
+            time=(now - timedelta(minutes=121)).timestamp(),
+            comment="JoeyCIO_91pct",
+        )
+        fake_mt5 = FakeMetaTrader5(
+            positions=[old_position],
+            order_retcode=FakeMetaTrader5.TRADE_RETCODE_DONE,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch.dict(sys.modules, {"MetaTrader5": fake_mt5}),
+                patch.object(mt5_bridge, "DEMO_POSITIONS_PATH", root / "demo_positions.json"),
+                patch.object(mt5_bridge, "DEMO_HISTORY_PATH", root / "demo_history.json"),
+                patch.dict("os.environ", {"NEWERA_TIME_STOP_MINUTES": "120"}, clear=False),
+            ):
+                result = mt5_bridge._inprocess_manage_demo_positions(
+                    now_override=now,
+                    atr_override=0.01,
+                )
+
+        self.assertEqual(result["time_stop_closed_tickets"], [77])
+        self.assertEqual(result["modifications"][0]["action_type"], "TIME_STOP")
+        self.assertEqual(len(fake_mt5.order_send_calls), 1)
+        self.assertEqual(fake_mt5.order_send_calls[0]["comment"], "NewEraTimeStop")
+        self.assertTrue(all(request["action"] != getattr(fake_mt5, "TRADE_ACTION_SLTP", 3) for request in fake_mt5.order_send_calls))
 
     def test_daily_cap_blocks_before_order_send(self) -> None:
         now = datetime.now(timezone.utc)
@@ -215,7 +353,7 @@ class Mt5SafetyTests(unittest.TestCase):
                         "BUY",
                         0.01,
                         sl=99.0,
-                        tp=101.0,
+                        tp=103.0,
                         allow_paper_fallback=True,
                     )
         self.assertEqual(fake_mt5.order_send_calls, [])

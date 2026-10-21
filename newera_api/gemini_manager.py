@@ -11,7 +11,7 @@ Implements:
    - Step 4 (Gemini CIO - "ჯოი"): Final Win-Probability (0-100%), Dynamic Risk Sizing & Lot Calculation:
      * < 65%: ABSTAIN / Pass (0% risk)
      * 65% - 80%: Standard Risk (0.25% - 0.50% equity risk)
-     * > 80% + L2 DOM Wall Support: Dynamic Increased Risk (1.00% - 1.25% equity risk)
+     * > 80% + L2 DOM Wall Support: Dynamic Increased Risk (1.00% - 1.25% equity risk, hard cap 1.50%)
 3. Interactive Georgian Co-Pilot Chat & One-Click Setup Analyzer ("ჯოი").
 """
 
@@ -40,6 +40,14 @@ except ImportError:
     talib = None
     np = None
     HAS_TALIB = False
+
+
+# Joey CIO profile safety limits.  Keep these deterministic and local to the
+# sizing/pipeline layer so a research report can never widen the execution
+# envelope by itself.
+MAX_RISK_PCT = 1.5
+MIN_REWARD_RISK = 1.5
+MAX_SL_ATR_MULT = 2.5
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +461,7 @@ class WaterfallDecision:
     symbol: str
     final_action: str  # "BUY", "SELL", "ABSTAIN"
     win_probability_pct: float  # 0.0 .. 100.0
-    risk_tier: str  # "ABSTAIN (<65%)", "STANDARD (0.25%-0.50%)", "DYNAMIC_HIGH (1.00%-1.25%)"
+    risk_tier: str  # "ABSTAIN (<65%)", "STANDARD (0.25%-0.50%)", "DYNAMIC_HIGH (1.00%-1.25%, cap 1.50%)"
     risk_pct: float  # e.g. 0.0, 0.38, 1.15
     recommended_lot: float
     sl_price: float
@@ -505,6 +513,9 @@ class GeminiPortfolioManager:
     """Autonomous Portfolio Manager & Dynamic Risk CIO ("ჯოი") powered by Gemini."""
 
     PERSONA_NAME = "ჯოი (Gemini Quant CIO)"
+    MAX_RISK_PCT = MAX_RISK_PCT
+    MIN_REWARD_RISK = MIN_REWARD_RISK
+    MAX_SL_ATR_MULT = MAX_SL_ATR_MULT
     # NOTE: gemini-2.5-flash / 2.0-flash / 1.5-flash now return HTTP 404 for this key.
     # Order = fastest first. Override with GEMINI_MODEL=model_a,model_b in .env.
     DEFAULT_MODELS = ("gemini-3.5-flash", "gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite")
@@ -595,7 +606,7 @@ class GeminiPortfolioManager:
         Risk Hierarchy:
         - < 65%: ABSTAIN / Pass (0.0% risk, 0.00 lot)
         - 65% - 80%: Standard Risk (0.25% - 0.50% Lot Size)
-        - > 80% + L2 DOM Wall Support: Dynamic Increased Risk (1.00% - 1.25% Lot Size)
+        - > 80% + L2 DOM Wall Support: Dynamic Increased Risk (1.00% - 1.25% Lot Size, hard cap 1.50%)
         - > 80% without L2 Wall Support: Top of Standard Risk (0.50% Lot Size)
         """
         prob = max(0.0, min(100.0, float(win_probability_pct)))
@@ -613,6 +624,14 @@ class GeminiPortfolioManager:
                 "be_trigger_price": 0.0,
                 "partial_close_price": 0.0,
                 "trailing_distance": round(max(atr, point * 10), digits),
+                "reward_risk_ratio": 0.0,
+                "rr_ratio": 0.0,
+                "sl_distance": 0.0,
+                "tp_distance": 0.0,
+                "sl_atr_multiple": 0.0,
+                "tp_atr_multiple": 0.0,
+                "max_risk_pct": MAX_RISK_PCT,
+                "risk_constraint_status": "ABSTAIN",
             }
 
         if prob > 80.0 and l2_wall_support:
@@ -626,12 +645,48 @@ class GeminiPortfolioManager:
             risk_pct = round(0.25 + t * 0.25, 3)
             risk_tier = "STANDARD_RISK (0.25% - 0.50%)"
 
+        # Hard cap the profile even if a future tier or caller supplies a
+        # larger value.  The current tiers remain intentionally below this
+        # ceiling, preserving their existing behavior.
+        risk_pct = min(MAX_RISK_PCT, max(0.0, risk_pct))
         safe_equity = max(10.0, float(equity or 1000.0))
-        risk_usd = round(safe_equity * (risk_pct / 100.0), 2)
+        risk_usd = round(min(safe_equity * (MAX_RISK_PCT / 100.0), safe_equity * (risk_pct / 100.0)), 2)
 
-        safe_atr = max(float(atr or 0.0), point * 20.0, entry_price * 0.0008 if entry_price > 0 else 0.5)
-        sl_dist = safe_atr * max(0.5, sl_atr_mult)
-        tp_dist = safe_atr * max(0.8, tp_atr_mult)
+        try:
+            raw_atr = float(atr or 0.0)
+        except (TypeError, ValueError):
+            raw_atr = 0.0
+        if not math.isfinite(raw_atr) or raw_atr < 0.0:
+            raw_atr = 0.0
+        # When ATR evidence is present, use that measured ATR directly so the
+        # 2.5x ceiling is meaningful in the instrument's actual volatility
+        # units.  Only an unavailable/non-positive ATR uses the historical
+        # conservative fallback.
+        safe_atr = (
+            raw_atr
+            if raw_atr > 0.0
+            else max(point * 20.0, entry_price * 0.0008 if entry_price > 0 else 0.5)
+        )
+
+        try:
+            requested_sl_mult = float(sl_atr_mult)
+        except (TypeError, ValueError):
+            requested_sl_mult = 1.5
+        if not math.isfinite(requested_sl_mult):
+            requested_sl_mult = 1.5
+        effective_sl_mult = min(MAX_SL_ATR_MULT, max(0.5, requested_sl_mult))
+
+        try:
+            requested_tp_mult = float(tp_atr_mult)
+        except (TypeError, ValueError):
+            requested_tp_mult = 2.5
+        if not math.isfinite(requested_tp_mult):
+            requested_tp_mult = 2.5
+        effective_tp_mult = max(0.8, requested_tp_mult, effective_sl_mult * MIN_REWARD_RISK)
+
+        sl_dist = safe_atr * effective_sl_mult
+        tp_dist = safe_atr * effective_tp_mult
+        reward_risk_ratio = tp_dist / sl_dist if sl_dist > 1e-9 else 0.0
         be_dist = safe_atr * 1.0  # +1.0x ATR Break-Even trigger
         partial_dist = safe_atr * 2.0  # +2.0x ATR 50% Partial Close trigger
 
@@ -640,11 +695,24 @@ class GeminiPortfolioManager:
         else:
             loss_per_lot = sl_dist * (contract_size if contract_size > 0 else 100.0)
 
-        raw_lot = (risk_usd / loss_per_lot) if loss_per_lot > 1e-9 else volume_min
+        raw_lot = (risk_usd / loss_per_lot) if loss_per_lot > 1e-9 else 0.0
         step = volume_step if volume_step > 0 else 0.01
-        clamped_lot = max(volume_min, min(volume_max, raw_lot))
-        final_lot = round(round(clamped_lot / step) * step, 2)
-        final_lot = max(volume_min, final_lot)
+        # Round down to the broker step so the realized stop-loss exposure
+        # cannot exceed the profile budget.  If even the broker minimum would
+        # exceed it, fail closed instead of forcing a too-large minimum lot.
+        if raw_lot <= 0.0 or volume_min <= 0.0 or volume_min * loss_per_lot > risk_usd + 1e-9:
+            final_lot = 0.0
+        else:
+            stepped_lot = math.floor((raw_lot + 1e-12) / step) * step
+            clamped_lot = min(volume_max, max(volume_min, stepped_lot))
+            # Keep the final two-decimal presentation from rounding back up
+            # over the already-safe stepped amount.
+            final_lot = math.floor(clamped_lot * 100.0 + 1e-12) / 100.0
+            if final_lot < volume_min:
+                final_lot = 0.0
+
+        realized_risk_usd = round(final_lot * loss_per_lot, 2)
+        realized_risk_pct = round((realized_risk_usd / safe_equity) * 100.0, 4) if safe_equity > 0 else 0.0
 
         if entry_price > 0:
             if norm_side == "BUY":
@@ -664,16 +732,28 @@ class GeminiPortfolioManager:
             part_px = 0.0
 
         return {
-            "action": norm_side,
+            "action": norm_side if final_lot > 0.0 else "ABSTAIN",
             "risk_tier": risk_tier,
             "risk_pct": risk_pct,
             "risk_usd": risk_usd,
+            "realized_risk_usd": realized_risk_usd,
+            "realized_risk_pct": realized_risk_pct,
             "lot_size": final_lot,
             "sl_price": sl_px,
             "tp_price": tp_px,
             "be_trigger_price": be_px,
             "partial_close_price": part_px,
             "trailing_distance": round(safe_atr, digits),
+            "sl_distance": sl_dist,
+            "tp_distance": tp_dist,
+            "sl_atr_multiple": effective_sl_mult,
+            "tp_atr_multiple": effective_tp_mult,
+            "reward_risk_ratio": reward_risk_ratio,
+            "rr_ratio": reward_risk_ratio,
+            "max_risk_pct": MAX_RISK_PCT,
+            "min_reward_risk": MIN_REWARD_RISK,
+            "max_sl_atr_multiple": MAX_SL_ATR_MULT,
+            "risk_constraint_status": "PASS" if final_lot > 0.0 else "ABSTAIN_MIN_LOT_EXCEEDS_RISK_CAP",
         }
 
     @staticmethod
@@ -919,7 +999,7 @@ class GeminiPortfolioManager:
         - Step 2 (Kronos + Matrix): Primary Direction & Probability Generation.
         - Step 3 (L2 DOM Orderflow): Safety Gate / Veto Check (checks opposing walls only).
         - Step 4 (Gemini CIO - "ჯოი"): Synthesizes all steps and determines Win-Prob (0-100%),
-          Risk Tier (<65% ABSTAIN, 65-80% 0.25-0.50%, >80% + L2 Wall 1.00-1.25%), and Lot Size.
+          Risk Tier (<65% ABSTAIN, 65-80% 0.25-0.50%, >80% + L2 Wall 1.00-1.25%, hard cap 1.50%), and Lot Size.
         """
         normalized_symbol = symbol.strip().upper()
         kr_supplied = isinstance(kronos_report, dict) and bool(kronos_report)
@@ -971,24 +1051,85 @@ class GeminiPortfolioManager:
         kr_conf = self._safe_report_float(kr.get("confidence"), 0.0)
         hard_blocks = decision_obj.get("hard_blocks") if isinstance(decision_obj.get("hard_blocks"), list) else []
 
-        component_directions = (matrix_dir, analog_dir, forecast_dir)
-        common_step2_dir = component_directions[0] if len(set(component_directions)) == 1 else "ABSTAIN"
-        step2_agrees = (
-            common_step2_dir in {"BUY", "SELL"}
-            and strict_action == common_step2_dir
-            and kr_conf > 0.0
+        # Step 2 uses qualified component votes rather than requiring all
+        # three research modules to agree.  A component only counts when its
+        # direction is backed by the evidence that module already reports.
+        component_support = {
+            "Matrix": matrix_dir in {"BUY", "SELL"}
             and matrix_score > 0.0
             and (
                 (matrix_dir == "BUY" and buy_score > sell_score)
                 or (matrix_dir == "SELL" and sell_score > buy_score)
-            )
-            and analog_wr >= 0.55
+            ),
+            "Analogue": analog_dir in {"BUY", "SELL"} and analog_wr >= 0.55,
+            "Forecast": forecast_dir in {"BUY", "SELL"}
             and path_agree >= 0.67
             and (
                 (forecast_dir == "BUY" and forecast_move_atr > 0.0)
                 or (forecast_dir == "SELL" and forecast_move_atr < 0.0)
+            ),
+        }
+        component_directions = {
+            "Matrix": matrix_dir,
+            "Analogue": analog_dir,
+            "Forecast": forecast_dir,
+        }
+        direction_support = {
+            direction: [
+                name
+                for name, component_direction in component_directions.items()
+                if component_support[name] and component_direction == direction
+            ]
+            for direction in ("BUY", "SELL")
+        }
+        buy_support = len(direction_support["BUY"])
+        sell_support = len(direction_support["SELL"])
+        if buy_support >= 2 and sell_support < 2:
+            selected_direction = "BUY"
+        elif sell_support >= 2 and buy_support < 2:
+            selected_direction = "SELL"
+        else:
+            selected_direction = "ABSTAIN"
+        confluence_count = max(buy_support, sell_support)
+        confluence_label = f"{confluence_count}-of-3"
+
+        # The upstream research gate historically reports ABSTAIN whenever a
+        # component disagrees.  ABSTAIN is therefore tolerated here, but an
+        # explicit opposite BUY/SELL action is treated as an inconsistent
+        # report and remains fail-closed.
+        strict_action_conflict = (
+            strict_action in {"BUY", "SELL"}
+            and selected_direction in {"BUY", "SELL"}
+            and strict_action != selected_direction
+        )
+        talib_trend = str(getattr(step1_talib, "trend_bias", "NEUTRAL") or "NEUTRAL").upper()
+        talib_trend_contradiction = (
+            selected_direction in {"BUY", "SELL"}
+            and talib_trend in {"BUY", "SELL"}
+            and talib_trend != selected_direction
+        )
+
+        # These blocks describe the one dissenting component or the ordinary
+        # pairwise disagreement that is expected under a 2-of-3 profile.  All
+        # other hard blocks (cost, data integrity, news, etc.) still veto.
+        blocking_hard_blocks = [
+            str(block)
+            for block in hard_blocks
+            if not (
+                str(block).strip().lower().startswith("matrix has no decisive breakout alignment")
+                or str(block).strip().lower().startswith("analog pattern has no sufficiently strong direction")
+                or str(block).strip().lower().startswith("kronos forecast has no sufficiently strong direction")
+                or str(block).strip().lower().startswith("matrix and analog directions disagree")
+                or str(block).strip().lower().startswith("matrix and kronos directions disagree")
             )
-            and not hard_blocks
+        ]
+        step2_agrees = (
+            selected_direction in {"BUY", "SELL"}
+            and confluence_count >= 2
+            and not strict_action_conflict
+            and not talib_trend_contradiction
+            and kr_conf > 0.0
+            and not blocking_hard_blocks
         )
 
         evidence_reasons: list[str] = []
@@ -996,15 +1137,26 @@ class GeminiPortfolioManager:
             evidence_reasons.append(kr_reason or "Kronos/Matrix report is missing or invalid")
         if not ta_valid:
             evidence_reasons.append(ta_reason or "TradingAgents report is missing or invalid")
-        if not step2_agrees:
-            evidence_reasons.append("Matrix, historical analogue, and forecast must agree on one direction")
+        if confluence_count < 2:
+            evidence_reasons.append("Step 2 requires at least 2-of-3 qualified Matrix/Analogue/Forecast votes")
+        elif strict_action_conflict:
+            evidence_reasons.append("Step 2 report action contradicts the selected component direction")
+        elif talib_trend_contradiction:
+            evidence_reasons.append(
+                f"TA-Lib trend {talib_trend} contradicts the selected Step 2 direction {selected_direction}"
+            )
+        elif blocking_hard_blocks:
+            evidence_reasons.extend(blocking_hard_blocks[:2])
+        elif not step2_agrees and kr_conf <= 0.0:
+            evidence_reasons.append("Step 2 confidence evidence is unavailable")
         if not getattr(step1_talib, "passed", False):
             evidence_reasons.append("TA-Lib Step 1 evidence is unavailable")
         if not isinstance(l2_snapshot, dict) or not l2_snapshot:
             evidence_reasons.append("L2 Step 3 evidence is unavailable")
 
-        # Step 2 is a strict conjunction, never a weighted vote.  Step 1 and
-        # Step 3 may veto/support that direction but may not manufacture one.
+        # Step 2 is a qualified 2-of-3 confluence gate, never a weighted vote.
+        # Step 1 and Step 3 may veto/support that direction but may not
+        # manufacture one.
         step1_available = bool(getattr(step1_talib, "passed", False))
         l2_available = False
         if isinstance(l2_snapshot, dict) and l2_snapshot:
@@ -1026,7 +1178,7 @@ class GeminiPortfolioManager:
             )
             l2_available = not empty_book and (has_price_evidence or has_book_signal)
         candidate_dir = (
-            common_step2_dir
+            selected_direction
             if step2_agrees and research_evidence_valid and step1_available and l2_available
             else "ABSTAIN"
         )
@@ -1035,23 +1187,19 @@ class GeminiPortfolioManager:
         base_prob = max(68.0, min(92.0, kr_conf * 100.0)) if candidate_dir in {"BUY", "SELL"} else 45.0
 
         # Step 1 (TA-Lib) synergy or Exhaustion Veto
-        talib_vetoed = False
+        talib_vetoed = bool(talib_trend_contradiction)
         if candidate_dir == "BUY":
             if step1_talib.veto_buy:
                 talib_vetoed = True
                 base_prob = min(base_prob, 48.0)
             elif step1_talib.trend_bias == "BUY":
                 base_prob += 5.5
-            elif step1_talib.trend_bias == "SELL":
-                base_prob -= 4.0
         elif candidate_dir == "SELL":
             if step1_talib.veto_sell:
                 talib_vetoed = True
                 base_prob = min(base_prob, 48.0)
             elif step1_talib.trend_bias == "SELL":
                 base_prob += 5.5
-            elif step1_talib.trend_bias == "BUY":
-                base_prob -= 4.0
 
         # --- STEP 3: L2 DOM Orderflow Safety Gate (Veto Check & Wall Support) ---
         l2 = l2_snapshot if isinstance(l2_snapshot, dict) else {}
@@ -1130,6 +1278,7 @@ class GeminiPortfolioManager:
         )
         step2_summary = {
             "candidate_direction": candidate_dir,
+            "selected_direction": selected_direction,
             "strict_gate_action": strict_action,
             "matrix_direction": matrix_dir,
             "matrix_score": round(matrix_score, 2),
@@ -1140,6 +1289,13 @@ class GeminiPortfolioManager:
             "forecast_direction": forecast_dir,
             "forecast_path_agreement_pct": round(path_agree * 100.0, 1),
             "forecast_move_atr": round(move_atr, 2),
+            "confluence_count": confluence_count,
+            "confluence_label": confluence_label,
+            "confluence": confluence_label,
+            "supporting_components": direction_support.get(selected_direction, []),
+            "component_support": component_support,
+            "talib_trend": talib_trend,
+            "talib_trend_contradiction": talib_trend_contradiction,
             "components_agree": step2_agrees,
             "evidence_valid": effective_research_evidence_valid,
             "evidence_reasons": evidence_reasons,
@@ -1166,6 +1322,11 @@ class GeminiPortfolioManager:
                 f"🛑 ჯოი (Gemini Quant CIO): Step 3 L2 DOM Safety Gate-მა დაბლოკა {candidate_dir} სიგნალი — "
                 f"წინააღმდეგობაზე დგას მსხვილი ლიკვიდობის კედელი ({l2_veto_reason}). საბოლოო გადაწყვეტილება: ABSTAIN."
             )
+        elif talib_trend_contradiction:
+            rationale_ka = (
+                f"🛑 ჯოი (Gemini Quant CIO): TA-Lib ტრენდი ({talib_trend}) ეწინააღმდეგება "
+                f"Step 2-ის {selected_direction} მიმართულებას. საბოლოო გადაწყვეტილება: ABSTAIN."
+            )
         elif talib_vetoed:
             rationale_ka = (
                 f"🛑 ჯოი (Gemini Quant CIO): Step 1 TA-Lib ფილტრმა დააფიქსირა RSI გადახურება ({step1_talib.veto_reason}). "
@@ -1190,9 +1351,19 @@ class GeminiPortfolioManager:
             "risk_tier": sizing["risk_tier"],
             "risk_pct": sizing["risk_pct"],
             "risk_usd": sizing["risk_usd"],
+            "realized_risk_usd": sizing.get("realized_risk_usd", 0.0),
+            "realized_risk_pct": sizing.get("realized_risk_pct", 0.0),
+            "max_risk_pct": sizing.get("max_risk_pct", MAX_RISK_PCT),
             "recommended_lot": sizing["lot_size"],
             "sl_price": sizing["sl_price"],
             "tp_price": sizing["tp_price"],
+            "sl_distance": sizing.get("sl_distance", 0.0),
+            "tp_distance": sizing.get("tp_distance", 0.0),
+            "sl_atr_multiple": sizing.get("sl_atr_multiple", 0.0),
+            "tp_atr_multiple": sizing.get("tp_atr_multiple", 0.0),
+            "reward_risk_ratio": sizing.get("reward_risk_ratio", 0.0),
+            "rr_ratio": sizing.get("rr_ratio", 0.0),
+            "risk_constraint_status": sizing.get("risk_constraint_status", "ABSTAIN"),
             "be_trigger_price": sizing["be_trigger_price"],
             "partial_close_price": sizing["partial_close_price"],
             "trailing_distance": sizing["trailing_distance"],
@@ -1370,7 +1541,8 @@ class GeminiPortfolioManager:
             "- You may only APPROVE or REJECT. You may only REDUCE size via risk_multiplier in [0.25, 1.0]; never increase.\n"
             "- REJECT if: modules conflict (e.g. TA-Lib trend vs signal), RSI exhausted in signal direction, "
             "L2 veto/opposing wall, SL/TP geometry is illogical (BUY needs SL < entry < TP; SELL the reverse), "
-            "reward:risk < 1.2, spread too wide vs ATR, or the evidence is weak/ambiguous.\n"
+            "reward:risk < 1.5, SL distance > 2.5 ATR, risk > 1.5% of equity, spread too wide vs ATR, "
+            "or the evidence is weak/ambiguous.\n"
             "- When in doubt, REJECT. Capital preservation beats activity.\n"
             "Return ONLY JSON: {\"verdict\": \"APPROVE\"|\"REJECT\", \"confidence_pct\": 0-100, "
             "\"risk_multiplier\": 0.25-1.0, \"reason_ka\": \"<= 2 short sentences in Georgian\"}"
@@ -1439,7 +1611,7 @@ class GeminiPortfolioManager:
             "1. Step 1 (TA-Lib ტექნიკური ფილტრი: RSI, ATR, EMA ტრენდი, MACD, ADX)\n"
             "2. Step 2 (Kronos Transformer + Matrix Breakout + 8-NN Historical Analogue)\n"
             "3. Step 3 (L2 Orderbook DOM & Liquidity Radar: Bid/Ask იმბალანსი, ვეშაპის კედლები, Veto სტატუსი)\n"
-            "4. Step 4 (ჯოის საბოლოო ვერდიქტი: BUY/SELL/ABSTAIN, Win-Probability %, რისკის ზომა 0.25%-1.25%, Lot Size, "
+            "4. Step 4 (ჯოის საბოლოო ვერდიქტი: BUY/SELL/ABSTAIN, Win-Probability %, რისკის ზომა 0.25%-1.50% cap-ით, Lot Size, "
             "SL, TP, +1x ATR Break-Even და +2x ATR 50% Partial Close გეგმა)."
         )
         compact_ctx = {
@@ -1571,7 +1743,8 @@ class GeminiPortfolioManager:
                 f"   • EMA(20/50/200): `{s1.get('ema_20', '--')}` / `{s1.get('ema_50', '--')}` / `{s1.get('ema_200', '--')}` | ADX: `{s1.get('adx_14', '--')}`",
                 "",
                 f"2️⃣ **Step 2 — Kronos Transformer & Matrix Breakout:**",
-                f"   • კანდიდატი მიმართულება: **{s2.get('candidate_direction', 'ABSTAIN')}** | Matrix ქულა: **{s2.get('matrix_score', 0.0)}/8.0**",
+                f"   • კანდიდატი მიმართულება: **{s2.get('candidate_direction', 'ABSTAIN')}** | "
+                f"კონფლუენსი: **{s2.get('confluence_label', '--')}** | Matrix ქულა: **{s2.get('matrix_score', 0.0)}/8.0**",
                 f"   • 8-NN ისტორიული ანალოგების Win-Rate: **{s2.get('analog_win_rate_pct', 50.0)}%** | Kronos Path Agreement: **{s2.get('forecast_path_agreement_pct', 50.0)}%**",
                 "",
                 f"3️⃣ **Step 3 — L2 DOM Orderflow & Liquidity Safety Gate:**",

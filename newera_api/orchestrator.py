@@ -59,6 +59,24 @@ SCREENER_SYMBOLS: tuple[str, ...] = (
 )
 AUTO_SCREENER_MIN_WIN_PROB: float = 68.0
 AUTO_SCREENER_INTERVAL_SECONDS: int = 120
+JOEY_LIVE_AUTO_EXECUTION_SYMBOLS: frozenset[str] = frozenset({"XAUUSD", "USTEC", "US500"})
+
+
+def is_joey_live_auto_execution_symbol(symbol: str) -> bool:
+    """Return whether JoeyCIO may open an autonomous Demo order for a symbol."""
+    return str(symbol or "").strip().upper() in JOEY_LIVE_AUTO_EXECUTION_SYMBOLS
+
+
+def build_joey_profile_comment(symbol: str, step2: dict[str, Any] | None) -> str:
+    """Build the compact MT5 comment used to profile JoeyCIO executions."""
+    normalized_symbol = str(symbol or "").strip().upper() or "UNKNOWN"
+    step2_obj = step2 if isinstance(step2, dict) else {}
+    try:
+        confluence_count = int(step2_obj.get("confluence_count") or 0)
+    except (TypeError, ValueError):
+        confluence_count = 0
+    confluence_count = max(0, min(3, confluence_count))
+    return f"JoeyCIO_{normalized_symbol}_{confluence_count}of3"[:31]
 
 LLM_ENV_KEYS: tuple[str, ...] = (
     "GEMINI_API_KEY",
@@ -195,6 +213,44 @@ class Orchestrator:
     @property
     def screener_report_path(self) -> Path:
         return self.settings.report_dir / "multi_pair_screener_latest.json"
+
+    @staticmethod
+    def _decision_atr(decision: Any, fallback: Any = 0.0) -> float:
+        """Extract the ATR used by the waterfall for bridge-side geometry checks."""
+        step1 = getattr(decision, "step1_talib", {})
+        if not isinstance(step1, dict):
+            step1 = {}
+        try:
+            value = float(step1.get("atr_14") or fallback or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return value if math.isfinite(value) and value > 0.0 else 0.0
+
+    @staticmethod
+    def _shadow_trade_payload(
+        decision: Any,
+        *,
+        symbol: str,
+        origin: str,
+    ) -> dict[str, Any]:
+        step2 = getattr(decision, "step2_kronos_matrix", {})
+        comment = build_joey_profile_comment(symbol, step2 if isinstance(step2, dict) else None)
+        return {
+            "virtual": True,
+            "execution_mode": "SHADOW",
+            "execution_source": "shadow_mode",
+            "symbol": str(symbol).strip().upper(),
+            "side": str(getattr(decision, "final_action", "ABSTAIN") or "ABSTAIN").upper(),
+            "volume": float(getattr(decision, "recommended_lot", 0.0) or 0.0),
+            "sl": float(getattr(decision, "sl_price", 0.0) or 0.0),
+            "tp": float(getattr(decision, "tp_price", 0.0) or 0.0),
+            "win_probability_pct": float(getattr(decision, "win_probability_pct", 0.0) or 0.0),
+            "risk_pct": float(getattr(decision, "risk_pct", 0.0) or 0.0),
+            "comment": comment,
+            "confluence": (step2 or {}).get("confluence_label", "0-of-3") if isinstance(step2, dict) else "0-of-3",
+            "origin": origin,
+            "logged_at": utc_now().isoformat(),
+        }
 
     async def MarketBookGet(
         self,
@@ -1010,6 +1066,7 @@ class Orchestrator:
 
         # 100% Autonomous Mode: quant signal -> live Gemini CIO review -> Demo execution
         autonomous_trade_result: dict[str, Any] | None = None
+        shadow_trade_result: dict[str, Any] | None = None
         gemini_review: dict[str, Any] | None = None
         if (
             self.gemini_cio.autonomous_mode
@@ -1020,45 +1077,73 @@ class Orchestrator:
             and waterfall_decision.recommended_lot >= 0.01
         ):
             try:
-                open_syms: set[str] = set()
-                try:
-                    pos_res = await self.get_open_positions()
-                    open_syms = {
-                        str(p.get("symbol") or "").strip().upper()
-                        for p in pos_res.get("positions", [])
-                        if isinstance(p, dict)
-                    }
-                except Exception:
-                    pass
-                if symbol.strip().upper() in open_syms:
+                if not is_joey_live_auto_execution_symbol(symbol):
+                    shadow_trade_result = self._shadow_trade_payload(
+                        waterfall_decision,
+                        symbol=symbol,
+                        origin="scan",
+                    )
                     await self._publish(
                         event(
-                            "process.log",
+                            "trade.shadow",
                             scan_id=job.scan_id,
                             source="gemini-cio-joey",
-                            message=f"[Autonomous CIO] {symbol} already has an open position — skipping duplicate entry.",
+                            symbol=symbol,
+                            shadow_trade=shadow_trade_result,
+                            message=(
+                                f"[SHADOW MODE] {symbol} {final_act} logged virtually; "
+                                "JoeyCIO auto-execution is limited to XAUUSD, USTEC, and US500."
+                            ),
                         ),
                         job,
                     )
                 else:
-                    approved, gated_volume, gemini_review = await self._gemini_gate_before_auto_trade(
-                        waterfall_decision,
-                        symbol=symbol,
-                        origin="scan",
-                        mt5_meta=mt5_meta if isinstance(mt5_meta, dict) else None,
-                        l2_snap=l2_snapshot if isinstance(l2_snapshot, dict) else None,
-                        open_symbols=open_syms,
-                    )
-                    if approved:
-                        autonomous_trade_result = await self.execute_demo_trade(
-                            symbol=symbol,
-                            side=final_act,
-                            volume=gated_volume,
-                            sl=waterfall_decision.sl_price,
-                            tp=waterfall_decision.tp_price,
-                            comment=f"JoeyCIO_{int(waterfall_decision.win_probability_pct)}pct",
-                            allow_paper_fallback=False,
+                    open_syms: set[str] = set()
+                    try:
+                        pos_res = await self.get_open_positions()
+                        open_syms = {
+                            str(p.get("symbol") or "").strip().upper()
+                            for p in pos_res.get("positions", [])
+                            if isinstance(p, dict)
+                        }
+                    except Exception:
+                        pass
+                    if symbol.strip().upper() in open_syms:
+                        await self._publish(
+                            event(
+                                "process.log",
+                                scan_id=job.scan_id,
+                                source="gemini-cio-joey",
+                                message=f"[Autonomous CIO] {symbol} already has an open position — skipping duplicate entry.",
+                            ),
+                            job,
                         )
+                    else:
+                        approved, gated_volume, gemini_review = await self._gemini_gate_before_auto_trade(
+                            waterfall_decision,
+                            symbol=symbol,
+                            origin="scan",
+                            mt5_meta=mt5_meta if isinstance(mt5_meta, dict) else None,
+                            l2_snap=l2_snapshot if isinstance(l2_snapshot, dict) else None,
+                            open_symbols=open_syms,
+                        )
+                        if approved and gated_volume >= 0.01:
+                            autonomous_trade_result = await self.execute_demo_trade(
+                                symbol=symbol,
+                                side=final_act,
+                                volume=gated_volume,
+                                sl=waterfall_decision.sl_price,
+                                tp=waterfall_decision.tp_price,
+                                atr=self._decision_atr(
+                                    waterfall_decision,
+                                    (mt5_meta or {}).get("atr_m5") if isinstance(mt5_meta, dict) else 0.0,
+                                ),
+                                comment=build_joey_profile_comment(
+                                    symbol,
+                                    waterfall_decision.step2_kronos_matrix,
+                                ),
+                                allow_paper_fallback=False,
+                            )
             except Exception as auto_exc:
                 await self._publish(
                     event(
@@ -1076,6 +1161,7 @@ class Orchestrator:
             "gate": gate,
             "waterfall": waterfall_dict,
             "autonomous_trade": autonomous_trade_result,
+            "shadow_trade": shadow_trade_result,
             "gemini_review": gemini_review,
             "mt5_sync": mt5_meta,
             "l2_orderflow": l2_snapshot,
@@ -1105,8 +1191,15 @@ class Orchestrator:
                 "kronos": kronos_report,
                 "tradingagents": trading_report,
                 "l2_orderflow": l2_snapshot,
+                "shadow_trade": shadow_trade_result,
             },
-            "result": "autonomous_demo_order_opened" if autonomous_trade_result else "research_cycle_completed_no_order",
+            "result": (
+                "autonomous_demo_order_opened"
+                if autonomous_trade_result
+                else "shadow_signal_logged"
+                if shadow_trade_result
+                else "research_cycle_completed_no_order"
+            ),
             "created_at": time.time(),
         }
         try:
@@ -1252,6 +1345,7 @@ class Orchestrator:
         volume: float,
         sl: float = 0.0,
         tp: float = 0.0,
+        atr: float | None = None,
         comment: str = "NewEraQuantDemo",
         allow_paper_fallback: bool = False,
     ) -> dict[str, Any]:
@@ -1264,6 +1358,7 @@ class Orchestrator:
             volume,
             sl=sl,
             tp=tp,
+            atr=atr,
             comment=comment,
             allow_paper_fallback=allow_paper_fallback,
         )
@@ -1416,7 +1511,14 @@ class Orchestrator:
         vol_min = float(meta.get("volume_min") or 0.01) or 0.01
         mult = float(review.get("risk_multiplier") or 0.0)
         volume = math.floor((base_lot * mult) / step + 1e-9) * step
-        volume = round(max(vol_min, volume), 2) if approved else 0.0
+        volume = round(volume, 2) if approved and volume >= vol_min else 0.0
+        if approved and volume <= 0.0:
+            approved = False
+            review = dict(review)
+            review["reason_ka"] = (
+                str(review.get("reason_ka") or "")
+                + " Broker minimum lot would exceed the JoeyCIO risk budget."
+            ).strip()
 
         side = str(getattr(wf_decision, "final_action", "ABSTAIN"))
         prob = float(getattr(wf_decision, "win_probability_pct", 0.0) or 0.0)
@@ -1448,6 +1550,10 @@ class Orchestrator:
             "interval_seconds": self.screener_interval_seconds,
             "min_win_probability_pct": AUTO_SCREENER_MIN_WIN_PROB,
             "symbols": list(self.screener_symbols),
+            "live_auto_execution_symbols": sorted(JOEY_LIVE_AUTO_EXECUTION_SYMBOLS),
+            "shadow_mode_symbols": sorted(
+                symbol for symbol in self.screener_symbols if not is_joey_live_auto_execution_symbol(symbol)
+            ),
             "gemini": self.gemini_cio.gemini_status(),
             "last_cycle": cached,
         }
@@ -1547,6 +1653,7 @@ class Orchestrator:
 
         pair_results: list[dict[str, Any]] = []
         auto_executed_trades: list[dict[str, Any]] = []
+        shadow_trades: list[dict[str, Any]] = []
 
         for sym in pairs:
             target_csv = (
@@ -1626,6 +1733,7 @@ class Orchestrator:
             wf_dict = wf_decision.to_dict()
 
             auto_trade_info: dict[str, Any] | None = None
+            shadow_trade_info: dict[str, Any] | None = None
             pair_review: dict[str, Any] | None = None
             if (
                 self.gemini_cio.autonomous_mode
@@ -1637,35 +1745,59 @@ class Orchestrator:
                 and sym not in open_symbols
             ):
                 try:
-                    approved, gated_volume, pair_review = await self._gemini_gate_before_auto_trade(
-                        wf_decision,
-                        symbol=sym,
-                        origin="8-pair-screener",
-                        mt5_meta=mt5_meta,
-                        l2_snap=l2_snap if isinstance(l2_snap, dict) else None,
-                        open_symbols=open_symbols,
-                    )
-                    if approved:
-                        auto_trade_info = await self.execute_demo_trade(
+                    if not is_joey_live_auto_execution_symbol(sym):
+                        shadow_trade_info = self._shadow_trade_payload(
+                            wf_decision,
                             symbol=sym,
-                            side=wf_decision.final_action,
-                            volume=gated_volume,
-                            sl=wf_decision.sl_price,
-                            tp=wf_decision.tp_price,
-                            comment=f"AutoScreener_{int(wf_decision.win_probability_pct)}pct",
-                            allow_paper_fallback=False,
+                            origin="8-pair-screener",
                         )
-                        open_symbols.add(sym)
-                        auto_executed_trades.append(
-                            {
-                                "symbol": sym,
-                                "side": wf_decision.final_action,
-                                "win_probability_pct": wf_decision.win_probability_pct,
-                                "lot": gated_volume,
-                                "gemini_review": pair_review,
-                                "trade": auto_trade_info,
-                            }
+                        shadow_trades.append(shadow_trade_info)
+                        await self.bus.publish(
+                            event(
+                                "trade.shadow",
+                                source="multi-pair-screener",
+                                symbol=sym,
+                                shadow_trade=shadow_trade_info,
+                                message=(
+                                    f"[SHADOW MODE] {sym} {wf_decision.final_action} logged virtually; "
+                                    "no autonomous order was sent."
+                                ),
+                            )
                         )
+                    else:
+                        approved, gated_volume, pair_review = await self._gemini_gate_before_auto_trade(
+                            wf_decision,
+                            symbol=sym,
+                            origin="8-pair-screener",
+                            mt5_meta=mt5_meta,
+                            l2_snap=l2_snap if isinstance(l2_snap, dict) else None,
+                            open_symbols=open_symbols,
+                        )
+                        if approved and gated_volume >= 0.01:
+                            auto_trade_info = await self.execute_demo_trade(
+                                symbol=sym,
+                                side=wf_decision.final_action,
+                                volume=gated_volume,
+                                sl=wf_decision.sl_price,
+                                tp=wf_decision.tp_price,
+                                atr=self._decision_atr(wf_decision, mt5_meta.get("atr_m5")),
+                                comment=build_joey_profile_comment(
+                                    sym,
+                                    wf_decision.step2_kronos_matrix,
+                                ),
+                                allow_paper_fallback=False,
+                            )
+                            open_symbols.add(sym)
+                            auto_executed_trades.append(
+                                {
+                                    "symbol": sym,
+                                    "side": wf_decision.final_action,
+                                    "win_probability_pct": wf_decision.win_probability_pct,
+                                    "lot": gated_volume,
+                                    "gemini_review": pair_review,
+                                    "trade": auto_trade_info,
+                                }
+                            )
                 except Exception as exec_exc:
                     await self.bus.publish(
                         event(
@@ -1691,6 +1823,14 @@ class Orchestrator:
                 "l2_wall_support": wf_decision.l2_wall_support,
                 "l2_vetoed": wf_decision.l2_vetoed,
                 "auto_executed": bool(auto_trade_info),
+                "execution_mode": "LIVE_AUTO" if is_joey_live_auto_execution_symbol(sym) else "SHADOW",
+                "auto_execution_allowed": is_joey_live_auto_execution_symbol(sym),
+                "shadow_mode": not is_joey_live_auto_execution_symbol(sym),
+                "shadow_trade": shadow_trade_info,
+                "profile_comment": build_joey_profile_comment(
+                    sym,
+                    wf_decision.step2_kronos_matrix,
+                ),
                 "waterfall": wf_dict,
             }
             pair_results.append(pair_summary)
@@ -1708,6 +1848,8 @@ class Orchestrator:
             "best_setup": best_setup,
             "auto_executed_count": len(auto_executed_trades),
             "auto_executed_trades": auto_executed_trades,
+            "shadow_logged_count": len(shadow_trades),
+            "shadow_trades": shadow_trades,
             "results": pair_results,
         }
         self._last_screener_cycle = cycle_payload

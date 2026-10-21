@@ -22,6 +22,25 @@ The API is intentionally safe-mode/research-first. Keep provider credentials
 out of source control and pass them through the environment only when a
 research provider is required.
 
+## JoeyCIO execution profile
+
+Autonomous Demo execution is allowlisted to **XAUUSD**, **USTEC**, and
+**US500**. Other scanned symbols remain in **SHADOW** mode: the waterfall is
+evaluated and a virtual signal is logged, but no order is sent. The profile
+also enforces:
+
+- Step 2 qualified **2-of-3** Matrix/Analogue/Forecast confluence with a
+  non-contradictory TA-Lib trend;
+- minimum reward:risk **1.5**, maximum stop distance **2.5 ATR**, and maximum
+  estimated risk **1.5% of equity**;
+- one open position per symbol, two open positions account-wide, and a
+  60-second per-symbol execution lock;
+- dynamic break-even/trailing management and a **120-minute** time-stop;
+- order comments such as `JoeyCIO_USTEC_2of3` for post-trade profiling.
+
+All of these are enforced again at the MT5 bridge boundary. Paper fallback is
+still opt-in and disabled by default.
+
 ## Runtime and dependencies
 
 - Python **3.13.5**, pinned in `.python-version`.

@@ -34,7 +34,13 @@ DEMO_POSITIONS_PATH = ROOT_DIR / "TradingAgentsData" / "research" / "demo_positi
 DEMO_HISTORY_PATH = ROOT_DIR / "TradingAgentsData" / "research" / "demo_history.json"
 DEMO_MAGIC_NUMBER = 20260418
 DEFAULT_MAX_OPEN_POSITIONS_PER_SYMBOL = 1
+DEFAULT_MAX_OPEN_POSITIONS_ACCOUNT = 2
 DEFAULT_MAX_DAILY_DEMO_TRADES = 10
+DEFAULT_SYMBOL_EXECUTION_LOCK_SECONDS = 60
+DEFAULT_TIME_STOP_MINUTES = 120
+DEFAULT_MAX_RISK_PCT = 1.5
+DEFAULT_MIN_REWARD_RISK = 1.5
+DEFAULT_MAX_SL_ATR_MULTIPLE = 2.5
 
 
 def _read_safety_limit(name: str, default: int) -> int:
@@ -54,16 +60,65 @@ MAX_OPEN_POSITIONS_PER_SYMBOL = _read_safety_limit(
     "NEWERA_MAX_OPEN_POSITIONS_PER_SYMBOL",
     DEFAULT_MAX_OPEN_POSITIONS_PER_SYMBOL,
 )
+MAX_OPEN_POSITIONS_ACCOUNT = _read_safety_limit(
+    "NEWERA_MAX_OPEN_POSITIONS_ACCOUNT",
+    DEFAULT_MAX_OPEN_POSITIONS_ACCOUNT,
+)
+# Descriptive alias for callers/tests that prefer the explicit account-wide name.
+MAX_OPEN_POSITIONS_ACCOUNT_WIDE = MAX_OPEN_POSITIONS_ACCOUNT
 MAX_DAILY_DEMO_TRADES = _read_safety_limit(
     "NEWERA_MAX_DAILY_DEMO_TRADES",
     DEFAULT_MAX_DAILY_DEMO_TRADES,
 )
+SYMBOL_EXECUTION_LOCK_SECONDS = _read_safety_limit(
+    "NEWERA_SYMBOL_EXECUTION_LOCK_SECONDS",
+    DEFAULT_SYMBOL_EXECUTION_LOCK_SECONDS,
+)
+TIME_STOP_MINUTES = _read_safety_limit(
+    "NEWERA_TIME_STOP_MINUTES",
+    DEFAULT_TIME_STOP_MINUTES,
+)
+# Descriptive alias for callers/tests that prefer the position-specific name.
+POSITION_TIME_STOP_MINUTES = TIME_STOP_MINUTES
 _DEMO_EXECUTION_LOCK = threading.Lock()
+_EXECUTION_LOCK_STATE_GUARD = threading.Lock()
+_EXECUTION_LOCK_STATE: dict[str, float] = {}
 
 
 def _configured_safety_limit(name: str, configured: int) -> int:
     """Allow a process environment override while treating malformed values as zero."""
     return _read_safety_limit(name, configured)
+
+
+def _configured_safety_limit_alias(names: tuple[str, ...], configured: int) -> int:
+    """Read the first explicitly configured safety limit from a list of env names."""
+    for name in names:
+        if os.getenv(name) is not None:
+            return _read_safety_limit(name, configured)
+    return configured
+
+
+def _configured_account_position_limit() -> int:
+    return _configured_safety_limit_alias(
+        ("NEWERA_MAX_OPEN_POSITIONS_ACCOUNT", "NEWERA_MAX_OPEN_POSITIONS_ACCOUNT_WIDE"),
+        MAX_OPEN_POSITIONS_ACCOUNT,
+    )
+
+
+def _configured_execution_lock_seconds() -> int:
+    value = _configured_safety_limit_alias(
+        ("NEWERA_SYMBOL_EXECUTION_LOCK_SECONDS", "NEWERA_EXECUTION_LOCK_SECONDS"),
+        SYMBOL_EXECUTION_LOCK_SECONDS,
+    )
+    return value if value > 0 else DEFAULT_SYMBOL_EXECUTION_LOCK_SECONDS
+
+
+def _configured_time_stop_minutes() -> int:
+    value = _configured_safety_limit_alias(
+        ("NEWERA_TIME_STOP_MINUTES", "NEWERA_POSITION_TIME_STOP_MINUTES"),
+        TIME_STOP_MINUTES,
+    )
+    return value if value > 0 else DEFAULT_TIME_STOP_MINUTES
 
 
 def _is_order_safety_rejection(mt5: Any, retcode: int) -> bool:
@@ -109,8 +164,96 @@ def _validate_sl_tp_geometry(side: str, entry_price: float, sl: float, tp: float
         raise ValueError(f"Invalid {norm_side} SL/TP geometry: require {requirement}.")
 
 
+def validate_joey_risk_geometry(
+    side: str,
+    entry_price: float,
+    sl: float,
+    tp: float,
+    *,
+    atr: float,
+    volume: float,
+    equity: float,
+    tick_value: float = 0.0,
+    tick_size: float = 0.0,
+    contract_size: float = 100.0,
+    max_risk_pct: float = DEFAULT_MAX_RISK_PCT,
+    min_reward_risk: float = DEFAULT_MIN_REWARD_RISK,
+    max_sl_atr_multiple: float = DEFAULT_MAX_SL_ATR_MULTIPLE,
+) -> dict[str, float]:
+    """Enforce JoeyCIO's risk, reward, and ATR limits at the execution boundary."""
+    _validate_sl_tp_geometry(side, entry_price, sl, tp)
+    try:
+        safe_atr = float(atr)
+        safe_volume = float(volume)
+        safe_equity = float(equity)
+        safe_tick_value = float(tick_value)
+        safe_tick_size = float(tick_size)
+        safe_contract_size = float(contract_size)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("JoeyCIO risk geometry values must be numeric.") from exc
+    if not all(
+        math.isfinite(value)
+        for value in (
+            safe_atr,
+            safe_volume,
+            safe_equity,
+            safe_tick_value,
+            safe_tick_size,
+            safe_contract_size,
+        )
+    ) or safe_atr <= 0 or safe_volume <= 0 or safe_equity <= 0:
+        raise ValueError("SAFETY BLOCK: ATR, volume, and account equity must be positive finite values.")
+
+    entry = float(entry_price)
+    stop = float(sl)
+    target = float(tp)
+    risk_distance = abs(entry - stop)
+    reward_distance = abs(target - entry)
+    rr_ratio = reward_distance / risk_distance if risk_distance > 0 else 0.0
+    sl_atr_multiple = risk_distance / safe_atr
+    if rr_ratio + 1e-9 < float(min_reward_risk):
+        raise ValueError(
+            f"SAFETY BLOCK: reward:risk {rr_ratio:.2f} is below the JoeyCIO minimum {float(min_reward_risk):.2f}."
+        )
+    if sl_atr_multiple - 1e-9 > float(max_sl_atr_multiple):
+        raise ValueError(
+            f"SAFETY BLOCK: SL distance is {sl_atr_multiple:.2f} ATR, above the {float(max_sl_atr_multiple):.2f} ATR limit."
+        )
+
+    if safe_tick_value > 0 and safe_tick_size > 0:
+        loss_per_lot = (risk_distance / safe_tick_size) * safe_tick_value
+    else:
+        loss_per_lot = risk_distance * max(safe_contract_size, 0.0)
+    risk_usd = safe_volume * loss_per_lot
+    risk_pct = (risk_usd / safe_equity) * 100.0
+    if risk_pct - 1e-9 > float(max_risk_pct):
+        raise ValueError(
+            f"SAFETY BLOCK: estimated risk {risk_pct:.3f}% exceeds the JoeyCIO cap of {float(max_risk_pct):.3f}%."
+        )
+    return {
+        "risk_distance": risk_distance,
+        "reward_distance": reward_distance,
+        "rr_ratio": rr_ratio,
+        "sl_atr_multiple": sl_atr_multiple,
+        "risk_usd": risk_usd,
+        "risk_pct": risk_pct,
+        "atr": safe_atr,
+    }
+
+
 # Public alias keeps the pure validation boundary easy to exercise without MT5.
 validate_sl_tp_geometry = _validate_sl_tp_geometry
+
+
+def prepare_order_comment(
+    comment: Any,
+    *,
+    default: str = "NewEraQuantDemo",
+    max_length: int = 31,
+) -> str:
+    """Preserve an execution profile comment while respecting MT5's 31-character limit."""
+    value = default if comment is None or str(comment) == "" else str(comment)
+    return value[: max(1, int(max_length))]
 
 
 def _field_value(row: Any, field: str, default: Any = None) -> Any:
@@ -143,6 +286,58 @@ def count_open_positions_for_symbol(
     return count
 
 
+def count_open_positions_account_wide(terminal_positions: Any, paper_positions: Any) -> int:
+    """Count all open terminal and Demo overlay positions for the account-wide cap."""
+    return len(list(terminal_positions or [])) + len(list(paper_positions or []))
+
+
+def execution_lock_remaining(
+    lock_state: dict[str, float],
+    symbol: str,
+    *,
+    now: float,
+    lock_seconds: float = DEFAULT_SYMBOL_EXECUTION_LOCK_SECONDS,
+) -> float:
+    """Return deterministic remaining cooldown seconds for a normalized symbol."""
+    key = str(symbol or "").strip().upper()
+    duration = max(float(lock_seconds), 0.0)
+    if not key or duration <= 0:
+        return 0.0
+    try:
+        last_execution = float(lock_state.get(key, 0.0))
+        current = float(now)
+    except (TypeError, ValueError):
+        return 0.0
+    remaining = (last_execution + duration) - current
+    return round(remaining, 6) if remaining > 0 else 0.0
+
+
+def acquire_execution_lock(
+    lock_state: dict[str, float],
+    symbol: str,
+    *,
+    now: float,
+    lock_seconds: float = DEFAULT_SYMBOL_EXECUTION_LOCK_SECONDS,
+) -> float:
+    """Reserve a symbol in a caller-owned lock state, returning remaining cooldown if blocked."""
+    remaining = execution_lock_remaining(
+        lock_state,
+        symbol,
+        now=now,
+        lock_seconds=lock_seconds,
+    )
+    key = str(symbol or "").strip().upper()
+    if remaining <= 0 and key and float(lock_seconds) > 0:
+        lock_state[key] = float(now)
+    return remaining
+
+
+def clear_execution_locks() -> None:
+    """Clear in-process execution cooldowns; intended for process/test lifecycle resets."""
+    with _EXECUTION_LOCK_STATE_GUARD:
+        _EXECUTION_LOCK_STATE.clear()
+
+
 def _coerce_utc_datetime(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
@@ -170,6 +365,41 @@ def _record_timestamps(row: Any) -> list[datetime]:
         if parsed is not None:
             timestamps.append(parsed)
     return timestamps
+
+
+def position_age_minutes(
+    position: Any,
+    *,
+    now: datetime | None = None,
+) -> float | None:
+    """Return a position's non-negative age in minutes, or ``None`` if its open time is unknown."""
+    opened_at: datetime | None = None
+    for field in ("opened_at", "open_time", "time", "timestamp"):
+        candidate = _coerce_utc_datetime(_field_value(position, field))
+        if candidate is not None:
+            opened_at = candidate
+            break
+    if opened_at is None:
+        return None
+
+    current = _coerce_utc_datetime(now) if now is not None else datetime.now(timezone.utc)
+    if current is None:
+        current = datetime.now(timezone.utc)
+    return max(0.0, (current - opened_at).total_seconds() / 60.0)
+
+
+def is_position_time_stop_due(
+    position: Any,
+    *,
+    now: datetime | None = None,
+    max_age_minutes: float = DEFAULT_TIME_STOP_MINUTES,
+) -> bool:
+    """Pure time-stop predicate; positions at or beyond the configured age are due for closure."""
+    limit = float(max_age_minutes)
+    if limit <= 0:
+        return False
+    age = position_age_minutes(position, now=now)
+    return age is not None and age >= limit
 
 
 def count_daily_demo_trades(records: Any, *, now: datetime | None = None) -> int:
@@ -914,6 +1144,21 @@ def compute_dynamic_position_adjustment(
     }
 
 
+def _trade_result_succeeded(mt5: Any, result: Any, *, allow_placed: bool = True) -> bool:
+    if result is None:
+        return False
+    success_codes = {
+        int(getattr(mt5, "TRADE_RETCODE_DONE", 10009)),
+        int(getattr(mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010)),
+    }
+    if allow_placed:
+        success_codes.add(int(getattr(mt5, "TRADE_RETCODE_PLACED", 10008)))
+    try:
+        return int(result.retcode) in success_codes
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def _inprocess_positions(symbol: str | None = None) -> dict[str, Any]:
     import MetaTrader5 as mt5
 
@@ -1029,8 +1274,10 @@ def _inprocess_manage_demo_positions(
     *,
     price_override: float | None = None,
     atr_override: float | None = None,
+    now_override: datetime | None = None,
 ) -> dict[str, Any]:
     """Run Dynamic Position Management on all open Demo positions:
+    - Positions at or beyond the 120-minute time-stop are closed first
     - +1.0x ATR profit -> Break-Even SL
     - > +1.0x ATR profit -> Dynamic Trailing Stop
     - +2.0x ATR profit -> 50% Partial Close
@@ -1043,6 +1290,10 @@ def _inprocess_manage_demo_positions(
         acc = _assert_demo_account(mt5)
         resolved_filter = _resolve_broker_symbol(mt5, symbol) if symbol else None
         modifications: list[dict[str, Any]] = []
+        now_utc = _coerce_utc_datetime(now_override) or datetime.now(timezone.utc)
+        time_stop_minutes = _configured_time_stop_minutes()
+        time_stop_closed_tickets: list[int] = []
+        time_stop_errors: list[str] = []
 
         # 1. Manage live MT5 terminal positions on Demo account
         mt5_positions = mt5.positions_get(symbol=resolved_filter) if resolved_filter else mt5.positions_get()
@@ -1063,6 +1314,68 @@ def _inprocess_manage_demo_positions(
                     float(tick.bid if side == "BUY" else tick.ask) if tick else float(pos.price_current)
                 )
                 comment_str = str(getattr(pos, "comment", "") or "")
+
+                # Time-stop is evaluated before any break-even, trailing, or partial-close action.
+                position_age = position_age_minutes(pos, now=now_utc)
+                if is_position_time_stop_due(
+                    pos,
+                    now=now_utc,
+                    max_age_minutes=time_stop_minutes,
+                ):
+                    close_type = mt5.ORDER_TYPE_SELL if side == "BUY" else mt5.ORDER_TYPE_BUY
+                    close_price = cur_px if cur_px > 0 else float(pos.price_current)
+                    closed_this = False
+                    for filling_mode in (
+                        mt5.ORDER_FILLING_IOC,
+                        mt5.ORDER_FILLING_FOK,
+                        mt5.ORDER_FILLING_RETURN,
+                    ):
+                        time_stop_req = {
+                            "action": mt5.TRADE_ACTION_DEAL,
+                            "position": int(pos.ticket),
+                            "symbol": pos_sym,
+                            "volume": float(pos.volume),
+                            "type": close_type,
+                            "price": close_price,
+                            "deviation": 35,
+                            "magic": DEMO_MAGIC_NUMBER,
+                            "comment": "NewEraTimeStop",
+                            "type_time": mt5.ORDER_TIME_GTC,
+                            "type_filling": filling_mode,
+                        }
+                        result = mt5.order_send(time_stop_req)
+                        if _trade_result_succeeded(mt5, result, allow_placed=False):
+                            closed_this = True
+                            break
+
+                    if closed_this:
+                        ticket_id = int(pos.ticket)
+                        time_stop_closed_tickets.append(ticket_id)
+                        modifications.append(
+                            {
+                                "ticket": ticket_id,
+                                "symbol": pos_sym,
+                                "side": side,
+                                "action_type": "TIME_STOP",
+                                "new_sl": float(pos.sl),
+                                "new_volume": 0.0,
+                                "age_minutes": round(position_age or 0.0, 1),
+                                "comment": comment_str,
+                                "description": (
+                                    f"TIME_STOP (age={position_age:.1f}m >= {time_stop_minutes}m) "
+                                    "-> position closed"
+                                ),
+                            }
+                        )
+                        continue
+
+                    time_stop_errors.append(
+                        f"Could not time-stop MT5 ticket #{int(pos.ticket)} ({pos_sym})"
+                    )
+                    # Do not extend the life of an expired position with a new
+                    # break-even/trailing adjustment when the forced close fails.
+                    continue
+
                 raw_dict = {
                     "ticket": int(pos.ticket),
                     "symbol": pos_sym,
@@ -1161,6 +1474,65 @@ def _inprocess_manage_demo_positions(
             else:
                 cur_px = float(item.get("price_current") or item.get("price_open") or 0.0)
 
+            # Remove an expired Demo overlay before applying dynamic management rules.
+            position_age = position_age_minutes(item, now=now_utc)
+            if is_position_time_stop_due(
+                item,
+                now=now_utc,
+                max_age_minutes=time_stop_minutes,
+            ):
+                item_ticket = int(item.get("ticket") or 0)
+                item["price_current"] = cur_px
+                resolved_info = mt5.symbol_info(resolved_sym)
+                contract_size = float(getattr(resolved_info, "trade_contract_size", 100.0) if resolved_info else 100.0)
+                tick_value = float(getattr(resolved_info, "trade_tick_value", 0.0) if resolved_info else 0.0)
+                tick_size = float(getattr(resolved_info, "trade_tick_size", 0.0) if resolved_info else 0.0)
+                enriched_closed = _enrich_position_metrics(
+                    item,
+                    point=point,
+                    digits=digits,
+                    contract_size=contract_size,
+                    tick_value=tick_value,
+                    tick_size=tick_size,
+                )
+                _append_paper_demo_history(
+                    {
+                        "ticket": item_ticket,
+                        "deal_id": item_ticket,
+                        "symbol": item_sym,
+                        "side": side,
+                        "volume": float(enriched_closed.get("volume") or 0.01),
+                        "entry_price": float(enriched_closed.get("price_open") or 0.0),
+                        "exit_price": float(enriched_closed.get("price_current") or 0.0),
+                        "open_time": str(item.get("opened_at") or datetime.now(timezone.utc).isoformat()),
+                        "close_time": now_utc.isoformat(),
+                        "realized_pnl": float(enriched_closed.get("profit") or 0.0),
+                        "digits": digits,
+                        "comment": str(item.get("comment") or "NewEraDemoClosed"),
+                        "close_reason": "time_stop",
+                        "source": "mt5_demo_paper_fallback",
+                    }
+                )
+                paper_changed = True
+                time_stop_closed_tickets.append(item_ticket)
+                modifications.append(
+                    {
+                        "ticket": item_ticket,
+                        "symbol": item_sym,
+                        "side": side,
+                        "action_type": "TIME_STOP",
+                        "new_sl": float(item.get("sl") or 0.0),
+                        "new_volume": 0.0,
+                        "age_minutes": round(position_age or 0.0, 1),
+                        "comment": str(item.get("comment") or ""),
+                        "description": (
+                            f"TIME_STOP (age={position_age:.1f}m >= {time_stop_minutes}m) "
+                            "-> paper position closed"
+                        ),
+                    }
+                )
+                continue
+
             adj = compute_dynamic_position_adjustment(
                 item,
                 atr=atr_val,
@@ -1192,12 +1564,23 @@ def _inprocess_manage_demo_positions(
             _save_paper_demo_positions(updated_paper)
 
         pos_snapshot = _inprocess_positions(symbol=symbol)
+        if time_stop_closed_tickets:
+            closed_set = set(time_stop_closed_tickets)
+            pos_snapshot["positions"] = [
+                item
+                for item in pos_snapshot.get("positions", [])
+                if int(item.get("ticket") or 0) not in closed_set
+            ]
+            pos_snapshot["count"] = len(pos_snapshot["positions"])
         return {
             "ok": True,
             "is_demo": True,
             "account_login": int(acc.login),
             "modified_count": len(modifications),
             "modifications": modifications,
+            "time_stop_closed_tickets": time_stop_closed_tickets,
+            "time_stop_errors": time_stop_errors,
+            "closed_tickets": time_stop_closed_tickets,
             "positions": pos_snapshot.get("positions", []),
         }
     finally:
@@ -1214,6 +1597,7 @@ def _inprocess_execute_demo_order_unlocked(
     *,
     sl: float = 0.0,
     tp: float = 0.0,
+    atr: float | None = None,
     comment: str = "NewEraQuantDemo",
     allow_paper_fallback: bool = False,
 ) -> dict[str, Any]:
@@ -1222,6 +1606,7 @@ def _inprocess_execute_demo_order_unlocked(
     norm_side = side.strip().upper()
     if norm_side not in {"BUY", "SELL"}:
         raise ValueError(f"Unsupported order side '{side}'; must be BUY or SELL.")
+    order_comment = prepare_order_comment(comment)
 
     if not mt5.initialize():
         raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
@@ -1229,6 +1614,28 @@ def _inprocess_execute_demo_order_unlocked(
         # Strict Demo Safety Gate: raises PermissionError if account is not DEMO
         acc = _assert_demo_account(mt5)
         resolved = _resolve_broker_symbol(mt5, symbol)
+        requested_symbol = str(symbol or "XAUUSD").strip().upper() or "XAUUSD"
+        lock_seconds = _configured_execution_lock_seconds()
+        with _EXECUTION_LOCK_STATE_GUARD:
+            lock_remaining = max(
+                execution_lock_remaining(
+                    _EXECUTION_LOCK_STATE,
+                    requested_symbol,
+                    now=time.monotonic(),
+                    lock_seconds=lock_seconds,
+                ),
+                execution_lock_remaining(
+                    _EXECUTION_LOCK_STATE,
+                    resolved,
+                    now=time.monotonic(),
+                    lock_seconds=lock_seconds,
+                ),
+            )
+        if lock_remaining > 0:
+            raise RuntimeError(
+                f"SAFETY BLOCK: {resolved} execution lock is active for "
+                f"{lock_remaining:.1f}s; no duplicate order was sent."
+            )
         mt5.symbol_select(resolved, True)
 
         info = mt5.symbol_info(resolved)
@@ -1272,7 +1679,38 @@ def _inprocess_execute_demo_order_unlocked(
         # fallback branch. Bad user levels are rejected, never repaired.
         _validate_sl_tp_geometry(norm_side, entry_price, sl_price, tp_price)
 
-        terminal_positions = mt5.positions_get(symbol=resolved) or []
+        # Use the caller's closed-candle ATR when the autonomous pipeline has
+        # already computed it; otherwise derive one from MT5 closed M5 bars.
+        # Missing ATR evidence is a safety failure, not a reason to widen the
+        # stop or silently skip the profile guard.
+        try:
+            atr_value = float(atr or 0.0)
+        except (TypeError, ValueError):
+            atr_value = 0.0
+        if not math.isfinite(atr_value) or atr_value <= 0.0:
+            rates = mt5.copy_rates_from_pos(resolved, mt5.TIMEFRAME_M5, 0, 60)
+            closed_rates = list(rates[:-1]) if rates is not None and len(rates) > 15 else []
+            atr_value = _compute_atr(closed_rates, 14) if closed_rates else 0.0
+        equity_value = float(getattr(acc, "equity", 0.0) or getattr(acc, "balance", 0.0) or 0.0)
+        risk_geometry = validate_joey_risk_geometry(
+            norm_side,
+            entry_price,
+            sl_price,
+            tp_price,
+            atr=atr_value,
+            volume=safe_vol,
+            equity=equity_value,
+            tick_value=tick_value,
+            tick_size=tick_size,
+            contract_size=contract_size,
+        )
+
+        positions_get = getattr(mt5, "positions_get", None)
+        if not callable(positions_get):
+            raise RuntimeError("SAFETY BLOCK: MT5 open positions cannot be inspected.")
+        terminal_positions = positions_get()
+        if terminal_positions is None:
+            raise RuntimeError("SAFETY BLOCK: MT5 open positions could not be read safely.")
         paper_positions = _load_paper_demo_positions(fail_closed=True)
         open_count = count_open_positions_for_symbol(
             terminal_positions,
@@ -1288,6 +1726,14 @@ def _inprocess_execute_demo_order_unlocked(
             raise RuntimeError(
                 f"SAFETY BLOCK: {resolved} already has {open_count} open position(s); "
                 f"the limit is {max_open} per symbol."
+            )
+
+        account_open_count = count_open_positions_account_wide(terminal_positions, paper_positions)
+        max_account_open = _configured_account_position_limit()
+        if account_open_count >= max_account_open:
+            raise RuntimeError(
+                f"SAFETY BLOCK: account-wide open-position cap reached "
+                f"({account_open_count}/{max_account_open}); no new order was sent."
             )
 
         history_deals_get = getattr(mt5, "history_deals_get", None)
@@ -1328,7 +1774,7 @@ def _inprocess_execute_demo_order_unlocked(
                 "price": entry_price,
                 "deviation": 35,
                 "magic": DEMO_MAGIC_NUMBER,
-                "comment": comment[:31],
+                "comment": order_comment,
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": filling_mode,
             }
@@ -1358,7 +1804,7 @@ def _inprocess_execute_demo_order_unlocked(
                         "tp": tp_price,
                         "profit": 0.0,
                         "opened_at": datetime.now(timezone.utc).isoformat(),
-                        "comment": comment,
+                        "comment": order_comment,
                         "source": "mt5_terminal",
                     },
                     point=point,
@@ -1375,6 +1821,9 @@ def _inprocess_execute_demo_order_unlocked(
                     "demo_overlay": False,
                     "paper_fallback": False,
                     "fallback_requested": bool(allow_paper_fallback),
+                    "risk_geometry": risk_geometry,
+                    "order_comment": order_comment,
+                    "comment": order_comment,
                     "retcode": int(res.retcode),
                     "retcode_comment": str(getattr(res, "comment", "Executed on MT5 Demo")),
                     "position": pos_payload,
@@ -1412,7 +1861,7 @@ def _inprocess_execute_demo_order_unlocked(
                 "trailing_active": False,
                 "partial_closed_50": False,
                 "opened_at": datetime.now(timezone.utc).isoformat(),
-                "comment": f"{comment} (DemoOverlay)",
+                "comment": order_comment,
                 "source": "mt5_demo_paper_fallback",
             }
             existing = paper_positions
@@ -1436,6 +1885,9 @@ def _inprocess_execute_demo_order_unlocked(
                 "demo_overlay": True,
                 "paper_fallback": True,
                 "fallback_requested": True,
+                "risk_geometry": risk_geometry,
+                "order_comment": order_comment,
+                "comment": order_comment,
                 "retcode": retcode,
                 "retcode_comment": (
                     f"MT5 Demo broker returned {retcode} ({ret_comment}); "
@@ -1459,20 +1911,35 @@ def _inprocess_execute_demo_order(
     *,
     sl: float = 0.0,
     tp: float = 0.0,
+    atr: float | None = None,
     comment: str = "NewEraQuantDemo",
     allow_paper_fallback: bool = False,
 ) -> dict[str, Any]:
-    """Serialize direct execution so duplicate checks cover check-and-open as one action."""
+    """Serialize check-and-send and enforce a per-symbol execution cooldown."""
+    requested_symbol = str(symbol or "XAUUSD").strip().upper() or "XAUUSD"
     with _DEMO_EXECUTION_LOCK:
-        return _inprocess_execute_demo_order_unlocked(
+        result = _inprocess_execute_demo_order_unlocked(
             symbol=symbol,
             side=side,
             volume=volume,
             sl=sl,
             tp=tp,
+            atr=atr,
             comment=comment,
             allow_paper_fallback=allow_paper_fallback,
         )
+        lock_seconds = _configured_execution_lock_seconds()
+        if result.get("ok") and lock_seconds > 0:
+            lock_now = time.monotonic()
+            locked_symbols = {
+                requested_symbol,
+                str((result.get("position") or {}).get("symbol") or "").strip().upper(),
+            }
+            with _EXECUTION_LOCK_STATE_GUARD:
+                for locked_symbol in locked_symbols:
+                    if locked_symbol:
+                        _EXECUTION_LOCK_STATE[locked_symbol] = lock_now
+        return result
 
 
 def _inprocess_close_demo_positions(
@@ -1879,6 +2346,7 @@ def execute_mt5_demo_order(
     *,
     sl: float = 0.0,
     tp: float = 0.0,
+    atr: float | None = None,
     comment: str = "NewEraQuantDemo",
     allow_paper_fallback: bool = False,
 ) -> dict[str, Any]:
@@ -1891,6 +2359,7 @@ def execute_mt5_demo_order(
             volume=volume,
             sl=sl,
             tp=tp,
+            atr=atr,
             comment=comment,
             allow_paper_fallback=allow_paper_fallback,
         )
@@ -1911,11 +2380,39 @@ def execute_mt5_demo_order(
             "--comment",
             comment,
         ]
+        if atr is not None:
+            cli_args.extend(["--atr", str(atr)])
         if allow_paper_fallback:
             cli_args.append("--paper-fallback")
         else:
             cli_args.append("--no-paper-fallback")
-        return _call_bridge_cli(cli_args, timeout=15.0)
+        requested_symbol = str(symbol or "XAUUSD").strip().upper() or "XAUUSD"
+        with _DEMO_EXECUTION_LOCK:
+            lock_seconds = _configured_execution_lock_seconds()
+            with _EXECUTION_LOCK_STATE_GUARD:
+                remaining = execution_lock_remaining(
+                    _EXECUTION_LOCK_STATE,
+                    requested_symbol,
+                    now=time.monotonic(),
+                    lock_seconds=lock_seconds,
+                )
+            if remaining > 0:
+                raise RuntimeError(
+                    f"SAFETY BLOCK: {requested_symbol} execution lock is active for "
+                    f"{remaining:.1f}s; no duplicate order was sent."
+                )
+            result = _call_bridge_cli(cli_args, timeout=15.0)
+            if result.get("ok") and lock_seconds > 0:
+                lock_now = time.monotonic()
+                locked_symbols = {
+                    requested_symbol,
+                    str((result.get("position") or {}).get("symbol") or "").strip().upper(),
+                }
+                with _EXECUTION_LOCK_STATE_GUARD:
+                    for locked_symbol in locked_symbols:
+                        if locked_symbol:
+                            _EXECUTION_LOCK_STATE[locked_symbol] = lock_now
+            return result
 
 
 def close_mt5_demo_positions(
@@ -1940,6 +2437,7 @@ def manage_mt5_demo_positions(
     *,
     price_override: float | None = None,
     atr_override: float | None = None,
+    now_override: datetime | None = None,
 ) -> dict[str, Any]:
     try:
         import MetaTrader5  # noqa: F401
@@ -1948,6 +2446,7 @@ def manage_mt5_demo_positions(
             symbol=symbol,
             price_override=price_override,
             atr_override=atr_override,
+            now_override=now_override,
         )
     except ImportError:
         cli_args = ["--action", "manage-demo"]
@@ -2018,6 +2517,7 @@ def _cli_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--volume", type=float, default=0.01)
     parser.add_argument("--sl", type=float, default=0.0)
     parser.add_argument("--tp", type=float, default=0.0)
+    parser.add_argument("--atr", type=float, default=None)
     parser.add_argument("--ticket", type=int, default=None)
     parser.add_argument("--comment", default="NewEraQuantDemo")
     parser.add_argument("--paper-fallback", dest="paper_fallback", action="store_true")
@@ -2047,6 +2547,7 @@ def _cli_main(argv: list[str] | None = None) -> int:
                 volume=args.volume,
                 sl=args.sl,
                 tp=args.tp,
+                atr=args.atr,
                 comment=args.comment,
                 allow_paper_fallback=args.paper_fallback,
             )
