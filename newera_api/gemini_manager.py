@@ -27,9 +27,10 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .config import ROOT, load_workspace_dotenv
+from .controls import DEFAULT_RUNTIME_CONTROLS, RuntimeControls
 
 try:
     import talib  # type: ignore[import-untyped]
@@ -479,6 +480,7 @@ class WaterfallDecision:
     rationale_ka: str
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     research_evidence_valid: bool = True
+    control_state: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -505,6 +507,7 @@ class WaterfallDecision:
             },
             "rationale_ka": self.rationale_ka,
             "research_evidence_valid": self.research_evidence_valid,
+            "controls": self.control_state,
             "created_at": self.created_at,
         }
 
@@ -600,6 +603,9 @@ class GeminiPortfolioManager:
         volume_min: float = 0.01,
         volume_max: float = 50.0,
         volume_step: float = 0.01,
+        max_risk_pct: float = MAX_RISK_PCT,
+        min_reward_risk: float = MIN_REWARD_RISK,
+        max_sl_atr_multiple: float = MAX_SL_ATR_MULT,
     ) -> dict[str, Any]:
         """Compute risk tier, exact risk %, lot size, and SL/TP/Break-Even/Partial-Close prices.
 
@@ -611,6 +617,9 @@ class GeminiPortfolioManager:
         """
         prob = max(0.0, min(100.0, float(win_probability_pct)))
         norm_side = side.strip().upper()
+        safe_max_risk_pct = min(MAX_RISK_PCT, max(0.0, float(max_risk_pct)))
+        safe_min_reward_risk = max(MIN_REWARD_RISK, float(min_reward_risk))
+        safe_max_sl_atr = min(MAX_SL_ATR_MULT, max(0.5, float(max_sl_atr_multiple)))
 
         if prob < 65.0 or norm_side not in {"BUY", "SELL"}:
             return {
@@ -630,7 +639,7 @@ class GeminiPortfolioManager:
                 "tp_distance": 0.0,
                 "sl_atr_multiple": 0.0,
                 "tp_atr_multiple": 0.0,
-                "max_risk_pct": MAX_RISK_PCT,
+                "max_risk_pct": safe_max_risk_pct,
                 "risk_constraint_status": "ABSTAIN",
             }
 
@@ -648,9 +657,9 @@ class GeminiPortfolioManager:
         # Hard cap the profile even if a future tier or caller supplies a
         # larger value.  The current tiers remain intentionally below this
         # ceiling, preserving their existing behavior.
-        risk_pct = min(MAX_RISK_PCT, max(0.0, risk_pct))
+        risk_pct = min(safe_max_risk_pct, max(0.0, risk_pct))
         safe_equity = max(10.0, float(equity or 1000.0))
-        risk_usd = round(min(safe_equity * (MAX_RISK_PCT / 100.0), safe_equity * (risk_pct / 100.0)), 2)
+        risk_usd = round(min(safe_equity * (safe_max_risk_pct / 100.0), safe_equity * (risk_pct / 100.0)), 2)
 
         try:
             raw_atr = float(atr or 0.0)
@@ -674,7 +683,7 @@ class GeminiPortfolioManager:
             requested_sl_mult = 1.5
         if not math.isfinite(requested_sl_mult):
             requested_sl_mult = 1.5
-        effective_sl_mult = min(MAX_SL_ATR_MULT, max(0.5, requested_sl_mult))
+        effective_sl_mult = min(safe_max_sl_atr, max(0.5, requested_sl_mult))
 
         try:
             requested_tp_mult = float(tp_atr_mult)
@@ -682,7 +691,7 @@ class GeminiPortfolioManager:
             requested_tp_mult = 2.5
         if not math.isfinite(requested_tp_mult):
             requested_tp_mult = 2.5
-        effective_tp_mult = max(0.8, requested_tp_mult, effective_sl_mult * MIN_REWARD_RISK)
+        effective_tp_mult = max(0.8, requested_tp_mult, effective_sl_mult * safe_min_reward_risk)
 
         sl_dist = safe_atr * effective_sl_mult
         tp_dist = safe_atr * effective_tp_mult
@@ -750,9 +759,9 @@ class GeminiPortfolioManager:
             "tp_atr_multiple": effective_tp_mult,
             "reward_risk_ratio": reward_risk_ratio,
             "rr_ratio": reward_risk_ratio,
-            "max_risk_pct": MAX_RISK_PCT,
-            "min_reward_risk": MIN_REWARD_RISK,
-            "max_sl_atr_multiple": MAX_SL_ATR_MULT,
+            "max_risk_pct": safe_max_risk_pct,
+            "min_reward_risk": safe_min_reward_risk,
+            "max_sl_atr_multiple": safe_max_sl_atr,
             "risk_constraint_status": "PASS" if final_lot > 0.0 else "ABSTAIN_MIN_LOT_EXCEEDS_RISK_CAP",
         }
 
@@ -980,6 +989,23 @@ class GeminiPortfolioManager:
             return default
         return parsed if math.isfinite(parsed) else default
 
+    @staticmethod
+    def _resolve_runtime_controls(
+        controls: RuntimeControls | Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Normalize a live control object or a plain mapping for one evaluation."""
+
+        if controls is None:
+            return RuntimeControls().execution_values()
+        if isinstance(controls, RuntimeControls):
+            return controls.execution_values()
+        if isinstance(controls, Mapping):
+            state = RuntimeControls()
+            allowed = {name: value for name, value in controls.items() if name in DEFAULT_RUNTIME_CONTROLS}
+            state.update(allowed)
+            return state.execution_values()
+        raise TypeError("controls must be RuntimeControls, a mapping, or None")
+
     def evaluate_waterfall_pipeline(
         self,
         *,
@@ -991,6 +1017,7 @@ class GeminiPortfolioManager:
         mt5_meta: dict[str, Any] | None = None,
         account_equity: float = 1000.0,
         market_csv: Path | None = None,
+        controls: RuntimeControls | Mapping[str, Any] | None = None,
     ) -> WaterfallDecision:
         """Execute the 4-Step Waterfall Decision Pipeline & Veto Hierarchy without module deadlocks.
 
@@ -1002,6 +1029,11 @@ class GeminiPortfolioManager:
           Risk Tier (<65% ABSTAIN, 65-80% 0.25-0.50%, >80% + L2 Wall 1.00-1.25%, hard cap 1.50%), and Lot Size.
         """
         normalized_symbol = symbol.strip().upper()
+        control_state = self._resolve_runtime_controls(controls)
+        gemini_cio_enabled = bool(control_state["gemini_cio_enabled"])
+        kronos_enabled = bool(control_state["kronos_enabled"])
+        l2_enabled = bool(control_state["l2_enabled"])
+        confluence_mode = str(control_state["confluence_mode"])
         kr_supplied = isinstance(kronos_report, dict) and bool(kronos_report)
         kr = kronos_report if kr_supplied else {}
         kr_valid, kr_reason = self._validate_research_report(
@@ -1027,9 +1059,13 @@ class GeminiPortfolioManager:
             ta_valid = False
             ta_reason = "TradingAgents report has no action field"
 
+        ta_direction = str(
+            ta.get("ai_action") or ta.get("consensus_action") or ta.get("mt5_gate_action") or ta.get("action") or "ABSTAIN"
+        ).upper()
+
         # A failed, stale, mismatched, or otherwise missing research phase is
         # never allowed to fall through to the last cached BUY/SELL.
-        research_evidence_valid = bool(kr_valid and kr) and bool(ta_valid)
+        research_evidence_valid = (not kronos_enabled or bool(kr_valid and kr)) and bool(ta_valid)
         decision_obj = kr.get("decision") if isinstance(kr.get("decision"), dict) else {}
         matrix_obj = decision_obj.get("matrix") if isinstance(decision_obj.get("matrix"), dict) else {}
         analog_obj = decision_obj.get("analog") if isinstance(decision_obj.get("analog"), dict) else {}
@@ -1084,25 +1120,38 @@ class GeminiPortfolioManager:
         }
         buy_support = len(direction_support["BUY"])
         sell_support = len(direction_support["SELL"])
-        if buy_support >= 2 and sell_support < 2:
+        required_votes = 3 if confluence_mode == "3-of-3" else 2
+        talib_trend = str(getattr(step1_talib, "trend_bias", "NEUTRAL") or "NEUTRAL").upper()
+        if not kronos_enabled:
+            # A disabled Kronos layer is a true bypass, not an automatic veto.
+            # Use the remaining raw TradingAgents direction (or TA-Lib trend as
+            # a deterministic fallback) and keep the bypass visible in step 2.
+            selected_direction = ta_direction if ta_direction in {"BUY", "SELL"} else (
+                talib_trend if talib_trend in {"BUY", "SELL"} else "ABSTAIN"
+            )
+        elif confluence_mode == "raw":
+            selected_direction = strict_action if strict_action in {"BUY", "SELL"} else "ABSTAIN"
+        elif buy_support >= required_votes and sell_support < required_votes:
             selected_direction = "BUY"
-        elif sell_support >= 2 and buy_support < 2:
+        elif sell_support >= required_votes and buy_support < required_votes:
             selected_direction = "SELL"
         else:
             selected_direction = "ABSTAIN"
-        confluence_count = max(buy_support, sell_support)
-        confluence_label = f"{confluence_count}-of-3"
+        confluence_count = max(buy_support, sell_support) if kronos_enabled else 0
+        confluence_label = (
+            "BYPASSED" if not kronos_enabled else (confluence_mode if confluence_mode == "raw" else f"{confluence_count}-of-3")
+        )
 
         # The upstream research gate historically reports ABSTAIN whenever a
         # component disagrees.  ABSTAIN is therefore tolerated here, but an
         # explicit opposite BUY/SELL action is treated as an inconsistent
         # report and remains fail-closed.
         strict_action_conflict = (
-            strict_action in {"BUY", "SELL"}
+            confluence_mode != "raw"
+            and strict_action in {"BUY", "SELL"}
             and selected_direction in {"BUY", "SELL"}
             and strict_action != selected_direction
         )
-        talib_trend = str(getattr(step1_talib, "trend_bias", "NEUTRAL") or "NEUTRAL").upper()
         talib_trend_contradiction = (
             selected_direction in {"BUY", "SELL"}
             and talib_trend in {"BUY", "SELL"}
@@ -1123,22 +1172,35 @@ class GeminiPortfolioManager:
                 or str(block).strip().lower().startswith("matrix and kronos directions disagree")
             )
         ]
-        step2_agrees = (
-            selected_direction in {"BUY", "SELL"}
-            and confluence_count >= 2
-            and not strict_action_conflict
-            and not talib_trend_contradiction
-            and kr_conf > 0.0
-            and not blocking_hard_blocks
-        )
+        if not kronos_enabled:
+            step2_agrees = (
+                selected_direction in {"BUY", "SELL"}
+                and ta_valid
+                and not talib_trend_contradiction
+            )
+        else:
+            step2_agrees = (
+                selected_direction in {"BUY", "SELL"}
+                and (confluence_mode == "raw" or confluence_count >= required_votes)
+                and not strict_action_conflict
+                and not talib_trend_contradiction
+                and (confluence_mode == "raw" or kr_conf > 0.0)
+                and not blocking_hard_blocks
+            )
 
         evidence_reasons: list[str] = []
-        if not kr_valid or not kr:
+        if not kronos_enabled:
+            evidence_reasons.append("Step 2 Kronos/Matrix layer is bypassed by runtime controls")
+        elif not kr_valid or not kr:
             evidence_reasons.append(kr_reason or "Kronos/Matrix report is missing or invalid")
         if not ta_valid:
             evidence_reasons.append(ta_reason or "TradingAgents report is missing or invalid")
-        if confluence_count < 2:
-            evidence_reasons.append("Step 2 requires at least 2-of-3 qualified Matrix/Analogue/Forecast votes")
+        if kronos_enabled and confluence_mode != "raw" and confluence_count < required_votes:
+            evidence_reasons.append(
+                f"Step 2 requires at least {required_votes}-of-3 qualified Matrix/Analogue/Forecast votes"
+            )
+        elif kronos_enabled and confluence_mode == "raw" and selected_direction not in {"BUY", "SELL"}:
+            evidence_reasons.append("Step 2 raw mode has no BUY or SELL action")
         elif strict_action_conflict:
             evidence_reasons.append("Step 2 report action contradicts the selected component direction")
         elif talib_trend_contradiction:
@@ -1151,15 +1213,15 @@ class GeminiPortfolioManager:
             evidence_reasons.append("Step 2 confidence evidence is unavailable")
         if not getattr(step1_talib, "passed", False):
             evidence_reasons.append("TA-Lib Step 1 evidence is unavailable")
-        if not isinstance(l2_snapshot, dict) or not l2_snapshot:
+        if l2_enabled and (not isinstance(l2_snapshot, dict) or not l2_snapshot):
             evidence_reasons.append("L2 Step 3 evidence is unavailable")
 
         # Step 2 is a qualified 2-of-3 confluence gate, never a weighted vote.
         # Step 1 and Step 3 may veto/support that direction but may not
         # manufacture one.
         step1_available = bool(getattr(step1_talib, "passed", False))
-        l2_available = False
-        if isinstance(l2_snapshot, dict) and l2_snapshot:
+        l2_available = not l2_enabled
+        if l2_enabled and isinstance(l2_snapshot, dict) and l2_snapshot:
             try:
                 mid_price = float(l2_snapshot.get("mid_price") or 0.0)
                 best_bid = float(l2_snapshot.get("best_bid") or 0.0)
@@ -1203,15 +1265,15 @@ class GeminiPortfolioManager:
 
         # --- STEP 3: L2 DOM Orderflow Safety Gate (Veto Check & Wall Support) ---
         l2 = l2_snapshot if isinstance(l2_snapshot, dict) else {}
-        l2_dir = str(l2.get("l2_direction") or "NEUTRAL").upper()
-        l2_conf = self._safe_report_float(l2.get("confluence_score"), 0.0)
+        l2_dir = str(l2.get("l2_direction") or "NEUTRAL").upper() if l2_enabled else "BYPASSED"
+        l2_conf = self._safe_report_float(l2.get("confluence_score"), 0.0) if l2_enabled else 0.0
         if l2_conf <= 1.0:
             l2_conf_pct = l2_conf * 100.0
         else:
             l2_conf_pct = l2_conf
-        veto_buy_l2 = bool(l2.get("veto_buy", False))
-        veto_sell_l2 = bool(l2.get("veto_sell", False))
-        l2_veto_reason = str(l2.get("veto_reason") or "")
+        veto_buy_l2 = bool(l2.get("veto_buy", False)) if l2_enabled else False
+        veto_sell_l2 = bool(l2.get("veto_sell", False)) if l2_enabled else False
+        l2_veto_reason = str(l2.get("veto_reason") or "") if l2_enabled else "L2 radar bypassed by runtime controls"
 
         l2_vetoed = False
         l2_wall_support = False
@@ -1236,7 +1298,7 @@ class GeminiPortfolioManager:
 
         # Optional TradingAgents Macro/Sentiment bonus.  A supplied but stale
         # or mismatched report already made ``research_evidence_valid`` false.
-        ta_act = str(ta.get("ai_action") or ta.get("consensus_action") or "ABSTAIN").upper()
+        ta_act = ta_direction
         if ta_act == candidate_dir and candidate_dir in {"BUY", "SELL"}:
             base_prob += 4.5
 
@@ -1270,13 +1332,35 @@ class GeminiPortfolioManager:
             volume_min=float(meta.get("volume_min") or 0.01),
             volume_max=float(meta.get("volume_max") or 50.0),
             volume_step=float(meta.get("volume_step") or 0.01),
+            max_risk_pct=float(control_state["risk_pct"]),
+            min_reward_risk=float(control_state["min_rr"]),
+            max_sl_atr_multiple=float(control_state["max_sl_atr"]),
         )
 
         final_action = str(sizing["action"])
         effective_research_evidence_valid = bool(
             research_evidence_valid and step2_agrees and step1_available and l2_available
         )
+        step1_summary = step1_talib.to_dict()
+        step1_summary["status"] = "PASS" if step1_available and not talib_vetoed else "BLOCKED"
+        step1_summary["reason"] = (
+            "TA-Lib technical filter passed"
+            if step1_summary["status"] == "PASS"
+            else (
+                f"TA-Lib trend {talib_trend} contradicts Step 2 direction {selected_direction}"
+                if talib_trend_contradiction
+                else str(step1_talib.veto_reason or "TA-Lib technical evidence is unavailable")
+            )
+        )
         step2_summary = {
+            "enabled": kronos_enabled,
+            "status": "BYPASSED" if not kronos_enabled else ("PASS" if step2_agrees else "BLOCKED"),
+            "reason": (
+                "Kronos/Matrix layer bypassed by runtime controls"
+                if not kronos_enabled
+                else ("qualified confluence passed" if step2_agrees else (evidence_reasons[0] if evidence_reasons else "confluence requirement not met"))
+            ),
+            "confluence_mode": confluence_mode,
             "candidate_direction": candidate_dir,
             "selected_direction": selected_direction,
             "strict_gate_action": strict_action,
@@ -1301,6 +1385,13 @@ class GeminiPortfolioManager:
             "evidence_reasons": evidence_reasons,
         }
         step3_summary = {
+            "enabled": l2_enabled,
+            "status": "BYPASSED" if not l2_enabled else ("BLOCKED" if l2_vetoed else ("PASS" if l2_available else "BLOCKED")),
+            "reason": (
+                "L2 radar bypassed by runtime controls"
+                if not l2_enabled
+                else (l2_veto_reason if l2_vetoed else ("L2 safety evidence passed" if l2_available else "L2 evidence is unavailable"))
+            ),
             "l2_direction": l2_dir,
             "confluence_score_pct": round(l2_conf_pct, 1),
             "veto_buy": veto_buy_l2,
@@ -1345,6 +1436,13 @@ class GeminiPortfolioManager:
             )
 
         step4_summary = {
+            "enabled": gemini_cio_enabled,
+            "status": "BYPASSED" if not gemini_cio_enabled else ("PASS" if final_action in {"BUY", "SELL"} else "BLOCKED"),
+            "reason": (
+                "Gemini CIO veto bypassed by explicit runtime override"
+                if not gemini_cio_enabled
+                else rationale_ka
+            ),
             "cio_agent": self.PERSONA_NAME,
             "final_action": final_action,
             "win_probability_pct": win_prob_pct,
@@ -1353,7 +1451,7 @@ class GeminiPortfolioManager:
             "risk_usd": sizing["risk_usd"],
             "realized_risk_usd": sizing.get("realized_risk_usd", 0.0),
             "realized_risk_pct": sizing.get("realized_risk_pct", 0.0),
-            "max_risk_pct": sizing.get("max_risk_pct", MAX_RISK_PCT),
+            "max_risk_pct": sizing.get("max_risk_pct", float(control_state["risk_pct"])),
             "recommended_lot": sizing["lot_size"],
             "sl_price": sizing["sl_price"],
             "tp_price": sizing["tp_price"],
@@ -1386,12 +1484,13 @@ class GeminiPortfolioManager:
             l2_wall_support=l2_wall_support,
             l2_vetoed=l2_vetoed,
             talib_vetoed=talib_vetoed,
-            step1_talib=step1_talib.to_dict(),
+            step1_talib=step1_summary,
             step2_kronos_matrix=step2_summary,
             step3_l2_safety=step3_summary,
             step4_gemini_cio=step4_summary,
             rationale_ka=rationale_ka,
             research_evidence_valid=effective_research_evidence_valid,
+            control_state=control_state,
         )
         self._last_decision = decision.to_dict()
         return decision

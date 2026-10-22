@@ -30,6 +30,7 @@ from typing import Any, Iterable
 from kronos_matrix_strategy import STRATEGY_ID, write_gate_csv
 
 from .config import ApiSettings, load_workspace_dotenv
+from .controls import RuntimeControls
 from .events import EventBus, event
 from .gemini_manager import GeminiPortfolioManager, Step1TALibResult, TALibTechnicalEngine
 from .memory import MemoryStore
@@ -45,6 +46,7 @@ from .mt5_bridge import (
 )
 from .orderflow_agent import OrderflowAnalysis, OrderflowLiquidityAgent, resolve_crypto_pair
 from .telegram_bot import TelegramRemoteController
+from .trade_logger import TradeDecisionLogger
 
 
 SCREENER_SYMBOLS: tuple[str, ...] = (
@@ -58,7 +60,7 @@ SCREENER_SYMBOLS: tuple[str, ...] = (
     "USTEC",
 )
 AUTO_SCREENER_MIN_WIN_PROB: float = 68.0
-AUTO_SCREENER_INTERVAL_SECONDS: int = 120
+AUTO_SCREENER_INTERVAL_SECONDS: int = 15
 JOEY_LIVE_AUTO_EXECUTION_SYMBOLS: frozenset[str] = frozenset({"XAUUSD", "USTEC", "US500"})
 
 
@@ -191,13 +193,22 @@ class Orchestrator:
         self.gemini_cio = GeminiPortfolioManager(self.settings.root)
         self.telegram = TelegramRemoteController(self.settings.root)
         self.telegram.set_command_handler(self._handle_telegram_command)
+        self.controls = RuntimeControls()
+        self.decision_logger = TradeDecisionLogger(
+            self.settings.decision_history_path,
+            self.bus,
+            max_records=max(1, int(getattr(self.settings, "decision_history_max_records", 1000))),
+        )
         self.paused: bool = False
         self._latest_l2: dict[str, dict[str, Any]] = {}
         self.jobs: dict[str, ScanJob] = {}
         self._active_scan_id: str | None = None
         self._lock = asyncio.Lock()
         self.screener_symbols: list[str] = list(SCREENER_SYMBOLS)
-        self.screener_interval_seconds: int = AUTO_SCREENER_INTERVAL_SECONDS
+        self.screener_interval_seconds: int = max(
+            1,
+            int(getattr(self.settings, "screener_interval_seconds", AUTO_SCREENER_INTERVAL_SECONDS)),
+        )
         self._screener_task: asyncio.Task[Any] | None = None
         self._screener_running: bool = False
         self._last_screener_cycle: dict[str, Any] | None = None
@@ -213,6 +224,38 @@ class Orchestrator:
     @property
     def screener_report_path(self) -> Path:
         return self.settings.report_dir / "multi_pair_screener_latest.json"
+
+    def get_controls(self) -> dict[str, Any]:
+        return self.controls.snapshot()
+
+    def update_controls(self, updates: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        self.controls.update(updates, **kwargs)
+        snapshot = self.controls.snapshot()
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                self.bus.publish(
+                    event(
+                        "controls.changed",
+                        source="runtime-controls",
+                        controls=snapshot,
+                        message=(
+                            "Runtime decision controls updated"
+                            if snapshot["override_active"]
+                            else "Runtime decision controls restored to safe defaults"
+                        ),
+                    )
+                )
+            )
+        except RuntimeError:
+            pass
+        return snapshot
+
+    def decision_history(self, limit: int | None = None) -> dict[str, Any]:
+        return {"records": self.decision_logger.read_records(limit)}
+
+    def decision_history_summary(self) -> dict[str, Any]:
+        return self.decision_logger.summary()
 
     @staticmethod
     def _decision_atr(decision: Any, fallback: Any = 0.0) -> float:
@@ -458,16 +501,117 @@ class Orchestrator:
             )
             return target_csv, spread_points, point_val, None
 
+    @staticmethod
+    def _decision_outcome(
+        waterfall: dict[str, Any] | None,
+        *,
+        autonomous_mode: bool,
+        paused: bool,
+        autonomous_trade: dict[str, Any] | None = None,
+        shadow_trade: dict[str, Any] | None = None,
+        gemini_review: dict[str, Any] | None = None,
+        symbol_in_open_positions: bool = False,
+    ) -> dict[str, str]:
+        """Derive telemetry mode and a stable block reason from one outcome."""
+
+        wf = waterfall if isinstance(waterfall, dict) else {}
+        final_action = str(wf.get("final_action") or "ABSTAIN").upper()
+        rationale = str(wf.get("rationale_ka") or wf.get("reason") or "").strip()
+        if autonomous_trade:
+            return {
+                "execution_mode": "LIVE",
+                "block_reason": "",
+                "reason": "Demo-only autonomous execution completed; real-account execution remains hard blocked.",
+                "final_decision": final_action,
+            }
+        if shadow_trade:
+            return {
+                "execution_mode": "SHADOW",
+                "block_reason": "symbol_shadow_allowlist",
+                "reason": "Signal recorded in SHADOW mode because the symbol is outside the demo auto-execution allowlist.",
+                "final_decision": final_action,
+            }
+        if final_action not in {"BUY", "SELL"}:
+            return {
+                "execution_mode": "BLOCKED",
+                "block_reason": "waterfall_abstain",
+                "reason": rationale or "Waterfall returned ABSTAIN; no order was eligible.",
+                "final_decision": "ABSTAIN",
+            }
+        if paused:
+            reason = "Trading is paused; no demo order was sent."
+            block_reason = "paused"
+        elif not autonomous_mode:
+            reason = "Autonomous mode is disabled; signal was evaluated but no demo order was sent."
+            block_reason = "autonomous_mode_disabled"
+        elif not bool(wf.get("research_evidence_valid", False)):
+            reason = "Research evidence was invalid or incomplete; execution was blocked."
+            block_reason = "research_evidence_invalid"
+        elif float(wf.get("win_probability_pct") or 0.0) < AUTO_SCREENER_MIN_WIN_PROB:
+            reason = f"Win probability is below the {AUTO_SCREENER_MIN_WIN_PROB:.0f}% execution threshold."
+            block_reason = "below_win_probability"
+        elif float(wf.get("recommended_lot") or 0.0) < 0.01:
+            reason = "Recommended lot is below the broker minimum/risk budget."
+            block_reason = "minimum_lot_or_risk_cap"
+        elif symbol_in_open_positions:
+            reason = f"{str(wf.get('symbol') or 'Symbol')} already has an open position."
+            block_reason = "position_already_open"
+        elif gemini_review and str(gemini_review.get("verdict") or "").upper() not in {"APPROVE", "BYPASSED"}:
+            reason = str(gemini_review.get("reason_ka") or "Gemini CIO vetoed the demo signal.")
+            block_reason = "gemini_cio_veto"
+        else:
+            reason = "Signal was not eligible for a demo execution under the current safety profile."
+            block_reason = "execution_guard"
+        return {
+            "execution_mode": "BLOCKED",
+            "block_reason": block_reason,
+            "reason": reason,
+            "final_decision": final_action,
+        }
+
+    async def _record_decision(
+        self,
+        *,
+        scan_id: str | None,
+        cycle: str | None,
+        symbol: str,
+        waterfall: dict[str, Any] | None,
+        signal: str | None,
+        outcome: dict[str, str],
+        source: str,
+        controls: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return await self.decision_logger.record_decision(
+            scan_id=scan_id,
+            cycle=cycle,
+            symbol=symbol,
+            signal=signal,
+            action=str((waterfall or {}).get("final_action") or outcome.get("final_decision") or "ABSTAIN"),
+            final_decision=outcome.get("final_decision") or "ABSTAIN",
+            execution_mode=outcome.get("execution_mode") or "BLOCKED",
+            reason=outcome.get("reason") or "decision recorded",
+            block_reason=outcome.get("block_reason") or "",
+            waterfall=waterfall,
+            metadata={
+                "source": source,
+                "controls": controls or self.controls.execution_values(),
+                "real_account_allowed": False,
+                "demo_only": True,
+            },
+        )
+
     async def _run_scan(self, job: ScanJob, request: dict[str, Any]) -> None:
         job.status = "running"
         job.started_at = utc_now()
         symbol = str(request.get("symbol") or self.settings.default_symbol).upper()
         ttl_minutes = int(request.get("gate_ttl_minutes") or 90)
+        controls_snapshot = self.controls.execution_values()
         include_tradingagents = bool(request.get("include_tradingagents", True))
-        include_kronos = bool(request.get("include_kronos", True))
+        include_kronos = bool(request.get("include_kronos", True)) and bool(controls_snapshot["kronos_enabled"])
         phase_results: list[dict[str, Any]] = []
         mt5_meta: dict[str, Any] | None = None
         l2_snapshot: dict[str, Any] | None = None
+        telemetry_recorded = False
         try:
             await self._publish(event("scan.started", scan_id=job.scan_id, symbol=symbol, mode=job.mode), job)
             if not include_tradingagents and not include_kronos:
@@ -475,20 +619,32 @@ class Orchestrator:
 
             # Phase 0: Capture L2 Orderbook & Liquidity Intelligence (`MarketBookGet`)
             try:
-                l2_snapshot = await self.MarketBookGet(symbol, levels=10, publish_events=True)
-                await self._publish(
-                    event(
-                        "kronos.forecast",
-                        scan_id=job.scan_id,
-                        source="orderflow-agent",
-                        message=(
-                            f"[L2 Orderflow Radar] {symbol} ({l2_snapshot.get('source')}) -> "
-                            f"Bid={l2_snapshot.get('bid_pressure_pct')}% / Ask={l2_snapshot.get('ask_pressure_pct')}% | "
-                            f"L2 Dir={l2_snapshot.get('l2_direction')} | Score={l2_snapshot.get('confluence_score')}%"
+                if not bool(controls_snapshot["l2_enabled"]):
+                    await self._publish(
+                        event(
+                            "process.log",
+                            scan_id=job.scan_id,
+                            source="orderflow-agent",
+                            message="[L2 Orderflow Radar] Bypassed by runtime controls.",
                         ),
-                    ),
-                    job,
-                )
+                        job,
+                    )
+                else:
+                    l2_snapshot = await self.MarketBookGet(symbol, levels=10, publish_events=True)
+                if l2_snapshot is not None:
+                    await self._publish(
+                        event(
+                            "kronos.forecast",
+                            scan_id=job.scan_id,
+                            source="orderflow-agent",
+                            message=(
+                                f"[L2 Orderflow Radar] {symbol} ({l2_snapshot.get('source')}) -> "
+                                f"Bid={l2_snapshot.get('bid_pressure_pct')}% / Ask={l2_snapshot.get('ask_pressure_pct')}% | "
+                                f"L2 Dir={l2_snapshot.get('l2_direction')} | Score={l2_snapshot.get('confluence_score')}%"
+                            ),
+                        ),
+                        job,
+                    )
             except Exception as l2_exc:
                 await self._publish(
                     event(
@@ -641,12 +797,35 @@ class Orchestrator:
                 mt5_meta=mt5_meta,
                 l2_snapshot=l2_snapshot,
                 ttl_minutes=ttl_minutes,
+                controls=controls_snapshot,
             )
             job.result = result
             job.return_code = max((int(item["return_code"]) for item in phase_results), default=0)
             job.status = "completed" if job.return_code == 0 else "failed"
             if job.status == "failed":
                 job.error = "one or more research phases stopped safely; gate remains ABSTAIN"
+            waterfall = result.get("waterfall") if isinstance(result, dict) else None
+            step2 = waterfall.get("steps", {}).get("step2_kronos_matrix", {}) if isinstance(waterfall, dict) else {}
+            outcome = self._decision_outcome(
+                waterfall,
+                autonomous_mode=self.gemini_cio.autonomous_mode,
+                paused=self.paused,
+                autonomous_trade=result.get("autonomous_trade") if isinstance(result, dict) else None,
+                shadow_trade=result.get("shadow_trade") if isinstance(result, dict) else None,
+                gemini_review=result.get("gemini_review") if isinstance(result, dict) else None,
+            )
+            decision_record = await self._record_decision(
+                scan_id=job.scan_id,
+                cycle=None,
+                symbol=symbol,
+                waterfall=waterfall if isinstance(waterfall, dict) else None,
+                signal=step2.get("candidate_direction") if isinstance(step2, dict) else None,
+                outcome=outcome,
+                source="scan",
+                controls=controls_snapshot,
+            )
+            result["decision_record"] = decision_record
+            telemetry_recorded = True
             await self._publish(
                 event("scan.completed", scan_id=job.scan_id, status=job.status, result=result),
                 job,
@@ -662,6 +841,35 @@ class Orchestrator:
             job.error = str(exc)
             await self._publish(event("scan.failed", scan_id=job.scan_id, error=str(exc)), job)
         finally:
+            if not telemetry_recorded:
+                try:
+                    fallback_waterfall = (
+                        job.result.get("waterfall")
+                        if isinstance(job.result, dict) and isinstance(job.result.get("waterfall"), dict)
+                        else None
+                    )
+                    fallback_outcome = self._decision_outcome(
+                        fallback_waterfall,
+                        autonomous_mode=self.gemini_cio.autonomous_mode,
+                        paused=self.paused,
+                    ) if fallback_waterfall else {
+                        "execution_mode": "BLOCKED",
+                        "block_reason": "scan_error",
+                        "reason": f"Scan failed before a waterfall decision: {job.error or 'unknown error'}",
+                        "final_decision": "ABSTAIN",
+                    }
+                    await self._record_decision(
+                        scan_id=job.scan_id,
+                        cycle=None,
+                        symbol=symbol,
+                        waterfall=fallback_waterfall,
+                        signal=None,
+                        outcome=fallback_outcome,
+                        source="scan",
+                        controls=controls_snapshot,
+                    )
+                except Exception:
+                    pass
             job.finished_at = utc_now()
             self._active_scan_id = None
 
@@ -941,6 +1149,7 @@ class Orchestrator:
         mt5_meta: dict[str, Any] | None = None,
         l2_snapshot: dict[str, Any] | None = None,
         ttl_minutes: int = 90,
+        controls: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         gate = self._read_gate(
             self.settings.kronos_gate_path,
@@ -1012,6 +1221,7 @@ class Orchestrator:
             mt5_meta=mt5_meta,
             account_equity=account_equity,
             market_csv=market_csv,
+            controls=controls or self.controls.execution_values(),
         )
         waterfall_dict = waterfall_decision.to_dict()
         try:
@@ -1126,6 +1336,7 @@ class Orchestrator:
                             mt5_meta=mt5_meta if isinstance(mt5_meta, dict) else None,
                             l2_snap=l2_snapshot if isinstance(l2_snapshot, dict) else None,
                             open_symbols=open_syms,
+                            controls=controls or self.controls.execution_values(),
                         )
                         if approved and gated_volume >= 0.01:
                             autonomous_trade_result = await self.execute_demo_trade(
@@ -1281,6 +1492,9 @@ class Orchestrator:
             "dynamic_trailing_enabled": self.gemini_cio.dynamic_trailing_enabled,
             "paused": self.paused,
             "telegram": self.telegram.status_summary(),
+            "controls": self.controls.snapshot(),
+            "decision_history_summary": self.decision_history_summary(),
+            "decision_history": self.decision_history(20)["records"],
             "execution_allowed": False,
             "real_account_allowed": False,
         }
@@ -1319,6 +1533,7 @@ class Orchestrator:
             symbol,
             price_override=price_override,
             atr_override=atr_override,
+            time_stop_minutes=self.controls.execution_values()["time_stop_minutes"],
         )
         for mod in payload.get("modifications", []):
             await self.bus.publish(
@@ -1477,6 +1692,7 @@ class Orchestrator:
         mt5_meta: dict[str, Any] | None = None,
         l2_snap: dict[str, Any] | None = None,
         open_symbols: Iterable[str] | None = None,
+        controls: dict[str, Any] | None = None,
     ) -> tuple[bool, float, dict[str, Any]]:
         """Final autonomous gate: the live Gemini API must APPROVE before any auto-trade.
 
@@ -1484,8 +1700,10 @@ class Orchestrator:
         """
         meta = mt5_meta if isinstance(mt5_meta, dict) else {}
         l2 = l2_snap if isinstance(l2_snap, dict) else {}
+        control_state = controls or self.controls.execution_values()
         ctx = {
             "origin": origin,
+            "controls": control_state,
             "utc_now": utc_now().isoformat(),
             "quote": {
                 "bid": meta.get("bid") or l2.get("best_bid"),
@@ -1503,8 +1721,21 @@ class Orchestrator:
             },
             "already_open_symbols": sorted(set(open_symbols or [])),
         }
-        review = await asyncio.to_thread(self.gemini_cio.review_trade_with_gemini, wf_decision, ctx)
-        approved = review.get("verdict") == "APPROVE"
+        if bool(control_state.get("gemini_cio_enabled", True)):
+            review = await asyncio.to_thread(self.gemini_cio.review_trade_with_gemini, wf_decision, ctx)
+        else:
+            review = {
+                "symbol": symbol,
+                "action": str(getattr(wf_decision, "final_action", "ABSTAIN")),
+                "verdict": "BYPASSED",
+                "risk_multiplier": 1.0,
+                "confidence_pct": 0.0,
+                "reason_ka": "Gemini CIO veto disabled by explicit runtime override; deterministic demo safeguards remain active.",
+                "model": None,
+                "source": "control_bypass",
+                "reviewed_at": utc_now().isoformat(),
+            }
+        approved = review.get("verdict") in {"APPROVE", "BYPASSED"}
 
         base_lot = float(getattr(wf_decision, "recommended_lot", 0.0) or 0.0)
         step = float(meta.get("volume_step") or 0.01) or 0.01
@@ -1555,6 +1786,9 @@ class Orchestrator:
                 symbol for symbol in self.screener_symbols if not is_joey_live_auto_execution_symbol(symbol)
             ),
             "gemini": self.gemini_cio.gemini_status(),
+            "controls": self.controls.snapshot(),
+            "decision_history_summary": self.decision_history_summary(),
+            "decision_history": self.decision_history(20)["records"],
             "last_cycle": cached,
         }
 
@@ -1608,7 +1842,7 @@ class Orchestrator:
                     )
                 )
             try:
-                await asyncio.sleep(float(max(60, self.screener_interval_seconds)))
+                await asyncio.sleep(float(max(1, self.screener_interval_seconds)))
             except asyncio.CancelledError:
                 break
 
@@ -1619,15 +1853,18 @@ class Orchestrator:
         """Iterate over the Top 8 pairs, run the 4-Step Waterfall Pipeline, and auto-execute Demo trades when Win-Prob >= 68%."""
         pairs = [str(s).strip().upper() for s in (symbols or self.screener_symbols) if str(s).strip()]
         started_ts = utc_now().isoformat()
+        cycle_id = f"screener-{uuid.uuid4()}"
+        controls_snapshot = self.controls.execution_values()
 
         await self.bus.publish(
             event(
                 "kronos.forecast",
+                scan_id=cycle_id,
                 source="multi-pair-screener",
                 message=(
                     f"[Autonomous Multi-Pair Screener] Scanning {len(pairs)} pairs "
                     f"({', '.join(pairs)}) | Auto-Exec={'ON' if self.gemini_cio.autonomous_mode else 'STANDBY'} "
-                    f"(Min Win-Prob >= {AUTO_SCREENER_MIN_WIN_PROB:.0f}%)..."
+                    f"(Min Win-Prob >= {AUTO_SCREENER_MIN_WIN_PROB:.0f}%) | cycle={cycle_id}..."
                 ),
             )
         )
@@ -1691,7 +1928,11 @@ class Orchestrator:
                         mt5_meta = {}
 
             try:
-                l2_snap = await self.MarketBookGet(sym, levels=10, publish_events=False)
+                l2_snap = (
+                    await self.MarketBookGet(sym, levels=10, publish_events=False)
+                    if bool(controls_snapshot["l2_enabled"])
+                    else {}
+                )
             except Exception:
                 l2_snap = {}
 
@@ -1709,10 +1950,14 @@ class Orchestrator:
             # Each pair gets only its own current reports.  A latest report for
             # XAUUSD is invalid evidence for EURUSD (and so on), even when the
             # local market CSV for the latter happens to exist.
-            cached_kronos = self._read_current_research_report(
-                self.settings.report_dir / "kronos_matrix_latest.json",
-                symbol=sym,
-                source="kronos",
+            cached_kronos = (
+                self._read_current_research_report(
+                    self.settings.report_dir / "kronos_matrix_latest.json",
+                    symbol=sym,
+                    source="kronos",
+                )
+                if bool(controls_snapshot["kronos_enabled"])
+                else None
             )
             cached_ta = self._read_current_research_report(
                 self.settings.report_dir / "tradingagents_latest.json",
@@ -1729,6 +1974,7 @@ class Orchestrator:
                 mt5_meta=mt5_meta,
                 account_equity=account_equity,
                 market_csv=target_csv,
+                controls=controls_snapshot,
             )
             wf_dict = wf_decision.to_dict()
 
@@ -1772,6 +2018,7 @@ class Orchestrator:
                             mt5_meta=mt5_meta,
                             l2_snap=l2_snap if isinstance(l2_snap, dict) else None,
                             open_symbols=open_symbols,
+                            controls=controls_snapshot,
                         )
                         if approved and gated_volume >= 0.01:
                             auto_trade_info = await self.execute_demo_trade(
@@ -1819,13 +2066,13 @@ class Orchestrator:
                 "tp_price": wf_decision.tp_price,
                 "talib_bias": step1_talib.trend_bias,
                 "rsi_14": round(step1_talib.rsi_14, 1),
-                "l2_direction": l2_snap.get("l2_direction", "NEUTRAL"),
+                "l2_direction": l2_snap.get("l2_direction", "BYPASSED" if not controls_snapshot["l2_enabled"] else "NEUTRAL"),
                 "l2_wall_support": wf_decision.l2_wall_support,
                 "l2_vetoed": wf_decision.l2_vetoed,
                 "auto_executed": bool(auto_trade_info),
-                "execution_mode": "LIVE_AUTO" if is_joey_live_auto_execution_symbol(sym) else "SHADOW",
+                "execution_mode": "LIVE" if auto_trade_info else "SHADOW" if shadow_trade_info else "BLOCKED",
                 "auto_execution_allowed": is_joey_live_auto_execution_symbol(sym),
-                "shadow_mode": not is_joey_live_auto_execution_symbol(sym),
+                "shadow_mode": bool(shadow_trade_info),
                 "shadow_trade": shadow_trade_info,
                 "profile_comment": build_joey_profile_comment(
                     sym,
@@ -1833,6 +2080,28 @@ class Orchestrator:
                 ),
                 "waterfall": wf_dict,
             }
+            outcome = self._decision_outcome(
+                wf_dict,
+                autonomous_mode=self.gemini_cio.autonomous_mode,
+                paused=self.paused,
+                autonomous_trade=auto_trade_info,
+                shadow_trade=shadow_trade_info,
+                gemini_review=pair_review,
+                symbol_in_open_positions=sym in open_symbols,
+            )
+            step2 = wf_dict.get("steps", {}).get("step2_kronos_matrix", {}) if isinstance(wf_dict, dict) else {}
+            decision_record = await self._record_decision(
+                scan_id=cycle_id,
+                cycle=cycle_id,
+                symbol=sym,
+                waterfall=wf_dict,
+                signal=step2.get("candidate_direction") if isinstance(step2, dict) else None,
+                outcome=outcome,
+                source="multi-pair-screener",
+                controls=controls_snapshot,
+            )
+            pair_summary["decision_record_id"] = decision_record["record_id"]
+            pair_summary["block_reason"] = outcome.get("block_reason") or ""
             pair_results.append(pair_summary)
 
         pair_results.sort(key=lambda item: float(item.get("win_probability_pct") or 0.0), reverse=True)
@@ -1840,6 +2109,7 @@ class Orchestrator:
 
         cycle_payload = {
             "ok": True,
+            "cycle_id": cycle_id,
             "started_at": started_ts,
             "finished_at": utc_now().isoformat(),
             "autonomous_mode": self.gemini_cio.autonomous_mode,
@@ -1850,6 +2120,8 @@ class Orchestrator:
             "auto_executed_trades": auto_executed_trades,
             "shadow_logged_count": len(shadow_trades),
             "shadow_trades": shadow_trades,
+            "controls": self.controls.snapshot(),
+            "decision_history_summary": self.decision_history_summary(),
             "results": pair_results,
         }
         self._last_screener_cycle = cycle_payload
@@ -1870,6 +2142,7 @@ class Orchestrator:
         await self.bus.publish(
             event(
                 "screener.completed",
+                scan_id=cycle_id,
                 source="multi-pair-screener",
                 pairs_scanned=len(pair_results),
                 best_setup=best_setup,
@@ -1884,9 +2157,14 @@ class Orchestrator:
 
     async def _build_joey_context(self, symbol: str, account_equity: float = 1000.0) -> dict[str, Any]:
         norm_sym = symbol.strip().upper() or "XAUUSD"
+        controls_snapshot = self.controls.execution_values()
         gates = self.latest_gates()
-        l2_snap = self._latest_l2.get(norm_sym) or gates.get("l2_orderflow")
-        if not l2_snap or str(l2_snap.get("symbol", "")).upper() != norm_sym:
+        l2_snap = (
+            self._latest_l2.get(norm_sym) or gates.get("l2_orderflow")
+            if controls_snapshot["l2_enabled"]
+            else {}
+        )
+        if controls_snapshot["l2_enabled"] and (not l2_snap or str(l2_snap.get("symbol", "")).upper() != norm_sym):
             try:
                 l2_snap = await self.MarketBookGet(norm_sym, levels=10, publish_events=False)
             except Exception:
@@ -1906,10 +2184,14 @@ class Orchestrator:
             fallback_close=float(mt5_sym.get("last_close") or (l2_snap or {}).get("mid_price") or 0.0),
             fallback_atr=float(mt5_sym.get("atr_m5") or 0.0),
         )
-        kronos_report = self._read_current_research_report(
-            self.settings.report_dir / "kronos_matrix_latest.json",
-            symbol=norm_sym,
-            source="kronos",
+        kronos_report = (
+            self._read_current_research_report(
+                self.settings.report_dir / "kronos_matrix_latest.json",
+                symbol=norm_sym,
+                source="kronos",
+            )
+            if controls_snapshot["kronos_enabled"]
+            else None
         )
         tradingagents_report = self._read_current_research_report(
             self.settings.report_dir / "tradingagents_latest.json",
@@ -1925,6 +2207,7 @@ class Orchestrator:
             mt5_meta=mt5_sym,
             account_equity=account_equity,
             market_csv=market_csv,
+            controls=controls_snapshot,
         )
         wf_dict = wf_decision.to_dict()
         try:

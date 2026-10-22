@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import json
 import math
 import os
@@ -25,13 +26,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QObject, Qt, QThread, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QTextCursor
+from PyQt6.QtCore import QObject, QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QFont, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QDockWidget,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -52,6 +55,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from newera_api.gui import BotStrategyLabPanel, Phase2WorkspaceTabs
 
 try:
     from PyQt6.QtWebEngineCore import QWebEngineSettings
@@ -306,6 +311,59 @@ QMainWindow, QWidget {
     color: #e2e8f0;
     font-family: "Segoe UI", "Inter", sans-serif;
     font-size: 12px;
+}
+
+QMenuBar {
+    background-color: #070a0f;
+    color: #cbd5e1;
+    border-bottom: 1px solid #1e293b;
+    padding: 2px 4px;
+    font-family: "Consolas", "Cascadia Mono", monospace;
+    font-size: 11px;
+    font-weight: bold;
+}
+
+QMenuBar::item {
+    background-color: transparent;
+    padding: 5px 10px;
+    margin: 1px;
+}
+
+QMenuBar::item:selected, QMenu::item:selected {
+    background-color: #1e3a5f;
+    color: #f8fafc;
+}
+
+QMenu {
+    background-color: #0f1623;
+    color: #e2e8f0;
+    border: 1px solid #2b3b55;
+    padding: 4px;
+}
+
+QMenu::item {
+    padding: 5px 22px 5px 10px;
+}
+
+QDockWidget {
+    color: #cbd5e1;
+    font-family: "Consolas", "Cascadia Mono", monospace;
+    font-size: 11px;
+    font-weight: bold;
+}
+
+QDockWidget::title {
+    background-color: #111827;
+    color: #38bdf8;
+    border: 1px solid #1e293b;
+    padding: 5px 8px;
+    text-align: left;
+}
+
+QLabel#Phase3WorkspaceHint, QLabel#Phase3StrategyStatus {
+    color: #94a3b8;
+    font-family: "Consolas", "Cascadia Mono", monospace;
+    font-size: 11px;
 }
 
 QFrame#HeaderPanel, QFrame#ControlPanel, QFrame#CardPanel {
@@ -952,6 +1010,7 @@ class NewEraDesktopTerminal(QMainWindow):
         self._current_tv_symbol = "XAUUSD"
         self._current_theme_name = "Bloomberg Dark"
         self._updating_symbol_combo = False
+        self._syncing_phase2_symbol = False
         self._ui_initialized = False
         self._l2_alerts_seen: set[str] = set()
         self._l2_alert_count = 0
@@ -979,6 +1038,15 @@ class NewEraDesktopTerminal(QMainWindow):
             "volume_max": 100.0,
             "volume_step": 0.01,
         }
+        self._workspace_settings = QSettings("NewEra", "NewEraTradingBot")
+        self.workspace_settings = self._workspace_settings
+        self._workspace_layout_version = 3
+        self._ws_connected = False
+        self._ws_status_text = "WS CONNECTING"
+        self._ws_ping_ms: float | None = None
+        self._last_ws_event_monotonic: float | None = None
+        self._last_ws_ping_sample_monotonic: float | None = None
+        self._active_bot_count = 0
 
         self.setWindowTitle(
             "New Era Trading Bot — Enterprise AI Quant Platform [8-Pair Auto-Screener • MT5 L2 DOM • TradingView • Kronos • Gemini CIO]"
@@ -1008,27 +1076,521 @@ class NewEraDesktopTerminal(QMainWindow):
         # 2. Control & Symbol Bar (Dynamic MT5 Symbols + One-Click/Auto Demo Execution + Scan Actions)
         root_layout.addWidget(self._build_control_panel())
 
-        # 3. Main Center Splitter:
-        #    Left (56%): Clean Interactive TradingView Chart + Quick Buy/Sell + Open Positions & History Manager
-        #    Right (44%): 5-Tab Quant Command Center
-        main_splitter = QSplitter(Qt.Orientation.Horizontal, self)
-        main_splitter.addWidget(self._build_tradingview_chart_panel())
-        main_splitter.addWidget(self._build_right_command_tabs())
-        main_splitter.setStretchFactor(0, 56)
-        main_splitter.setStretchFactor(1, 44)
-        main_splitter.setSizes([930, 720])
-        root_layout.addWidget(main_splitter, stretch=1)
+        # 3. Phase 2 surfaces remain the source of truth, but Phase 3 hosts
+        # each surface in a native, independently movable QDockWidget.
+        self.phase2_tabs = Phase2WorkspaceTabs(
+            execution_widget=self._build_execution_workspace_content(),
+            parent=self,
+        )
+        self.main_workspace_tabs = self.phase2_tabs
+        self.workspace_tabs = self.phase2_tabs
+        self.main_tabs = self.phase2_tabs
+        self.phase2_live_tab = self.phase2_tabs.live_execution_tab
+        self.phase2_controls_tab = self.phase2_tabs.quant_gate_tab
+        self.phase2_fleet_tab = self.phase2_tabs.bot_fleet_tab
+        self.phase2_audit_tab = self.phase2_tabs.decision_audit_tab
+        self.controls_tab = self.phase2_controls_tab
+        self.bot_fleet_tab = self.phase2_fleet_tab
+        self.audit_tab = self.phase2_audit_tab
+        self.phase2_live_tab.symbol_changed.connect(self._on_phase2_symbol_changed)
+        self.phase2_live_tab.refresh_requested.connect(self._on_phase2_live_refresh_requested)
+        self.phase2_controls_tab.apply_requested.connect(self._apply_phase2_controls)
+        self.phase2_controls_tab.refresh_requested.connect(self._request_controls_state)
+        self.phase2_fleet_tab.action_requested.connect(self._handle_bot_fleet_action)
+        self.phase2_audit_tab.refresh_requested.connect(self._request_decision_history)
+        self.ticker_combo.currentTextChanged.connect(self._sync_phase2_symbol_selector)
+        self._sync_phase2_symbol_selector(self.ticker_combo.currentText())
 
-        # 4. Status Bar
+        phase2_widgets = self.phase2_tabs.detach_tabs_for_docks()
+        self._build_phase3_docks(phase2_widgets)
+
+        workspace_canvas = QFrame(central)
+        workspace_canvas.setObjectName("CardPanel")
+        canvas_layout = QVBoxLayout(workspace_canvas)
+        canvas_layout.setContentsMargins(18, 18, 18, 18)
+        canvas_layout.setSpacing(8)
+        canvas_title = QLabel("NATIVE QUANT WORKSPACE")
+        canvas_title.setObjectName("SectionHeader")
+        canvas_copy = QLabel(
+            "Phase 3 panels are dockable, floatable, movable, and closable. "
+            "Use View to restore a hidden panel or Bot Lab to open Strategy Lab."
+        )
+        canvas_copy.setWordWrap(True)
+        canvas_copy.setObjectName("Phase3WorkspaceHint")
+        canvas_layout.addWidget(canvas_title)
+        canvas_layout.addWidget(canvas_copy)
+        canvas_layout.addStretch(1)
+        root_layout.addWidget(workspace_canvas, stretch=1)
+
+        self._build_status_bar()
+        self._build_phase3_menus()
+        self._restore_workspace_layout()
+
+    def _build_status_bar(self) -> None:
         status_bar = QStatusBar(self)
+        status_bar.setObjectName("Phase3StatusBar")
         self.setStatusBar(status_bar)
         self.status_message_label = QLabel("Initializing New Era Enterprise AI Quant Platform...")
         self.status_safety_label = QLabel(
             "MT5 DEMO EXECUTION: ACTIVE (DEMO ONLY)  |  8-PAIR AUTO-SCREENER: ON  |  SPREAD GATE: <= 180 PTS"
         )
         self.status_safety_label.setStyleSheet("color: #f59e0b; font-weight: bold; padding-right: 8px;")
+
+        self.status_api_label = QLabel("API: OFFLINE")
+        self.status_api_label.setObjectName("StatusApiLabel")
+        self.status_ws_ping_label = QLabel("WS PING: --")
+        self.status_ws_ping_label.setObjectName("StatusWsPingLabel")
+        self.status_active_bot_label = QLabel("ACTIVE BOTS: 0")
+        self.status_active_bot_label.setObjectName("StatusActiveBotLabel")
+        self.status_mt5_health_label = QLabel("MT5 HEALTH: CONNECTING")
+        self.status_mt5_health_label.setObjectName("StatusMt5HealthLabel")
+
+        # Reader-friendly aliases keep status widgets discoverable to Phase 3
+        # integrations without removing any Phase 2 header badges.
+        self.api_status_status_widget = self.status_api_label
+        self.ws_ping_status_widget = self.status_ws_ping_label
+        self.active_bot_status_widget = self.status_active_bot_label
+        self.mt5_health_status_widget = self.status_mt5_health_label
+        self.api_status_label = self.status_api_label
+        self.ws_ping_latency_label = self.status_ws_ping_label
+        self.active_bot_count_label = self.status_active_bot_label
+        self.mt5_health_label = self.status_mt5_health_label
+        self.ws_ping_label = self.status_ws_ping_label
+
+        for label in (
+            self.status_api_label,
+            self.status_ws_ping_label,
+            self.status_active_bot_label,
+            self.status_mt5_health_label,
+        ):
+            label.setStyleSheet(
+                "background-color: #131c2e; color: #94a3b8; border: 1px solid #233047; "
+                "border-radius: 3px; padding: 2px 6px; font-family: 'Consolas', monospace; "
+                "font-size: 10px; font-weight: bold;"
+            )
+
         status_bar.addWidget(self.status_message_label, stretch=1)
+        status_bar.addPermanentWidget(self.status_api_label)
+        status_bar.addPermanentWidget(self.status_ws_ping_label)
+        status_bar.addPermanentWidget(self.status_active_bot_label)
+        status_bar.addPermanentWidget(self.status_mt5_health_label)
         status_bar.addPermanentWidget(self.status_safety_label)
+
+    def _create_phase3_dock(
+        self,
+        key: str,
+        title: str,
+        widget: QWidget,
+        area: Qt.DockWidgetArea,
+    ) -> QDockWidget:
+        dock = QDockWidget(title, self)
+        dock.setObjectName(key)
+        dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
+        dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetClosable
+            | QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+        )
+        dock.setMinimumSize(280, 180)
+        dock.setWidget(widget)
+        self.addDockWidget(area, dock)
+        return dock
+
+    def _build_phase3_docks(self, phase2_widgets: tuple[QWidget, ...]) -> None:
+        if len(phase2_widgets) != 4:
+            raise RuntimeError("Phase 2 workspace did not provide four dockable surfaces")
+
+        self.strategy_lab_panel = BotStrategyLabPanel(self)
+        self.bot_strategy_lab_panel = self.strategy_lab_panel
+        self.strategy_lab_widget = self.strategy_lab_panel
+        self.strategy_backtester_panel = self.strategy_lab_panel
+        self.strategy_lab_panel.tool_requested.connect(self._on_strategy_lab_tool_requested)
+        self.strategy_lab_panel.strategy_save_requested.connect(self._request_strategy_save)
+        self.strategy_lab_panel.strategy_backtest_requested.connect(self._request_strategy_backtest)
+        self.strategy_lab_panel.strategy_walk_forward_requested.connect(self._request_strategy_walk_forward)
+        self.strategy_lab_panel.strategy_load_requested.connect(self._request_strategy_load)
+
+        self.live_chart_dock = self._create_phase3_dock(
+            "LiveChartExecutionDock",
+            "Live Chart / Execution",
+            phase2_widgets[0],
+            Qt.DockWidgetArea.LeftDockWidgetArea,
+        )
+        self.decision_audit_dock = self._create_phase3_dock(
+            "DecisionAuditDock",
+            "Decision Audit",
+            phase2_widgets[3],
+            Qt.DockWidgetArea.BottomDockWidgetArea,
+        )
+        self.quant_controls_dock = self._create_phase3_dock(
+            "QuantControlsDock",
+            "Quant Controls",
+            phase2_widgets[1],
+            Qt.DockWidgetArea.RightDockWidgetArea,
+        )
+        self.l2_orderbook_panel = QTextEdit(self)
+        self.l2_orderbook_panel.setObjectName("Phase3L2OrderbookPanel")
+        self.l2_orderbook_panel.setReadOnly(True)
+        self.l2_orderbook_panel.setPlaceholderText(
+            "L2 Orderbook telemetry will appear here when the MT5/DOM stream is available."
+        )
+        self.l2_orderbook_dock = self._create_phase3_dock(
+            "L2OrderbookDock",
+            "L2 Orderbook",
+            self.l2_orderbook_panel,
+            Qt.DockWidgetArea.RightDockWidgetArea,
+        )
+        self.bot_fleet_dock = self._create_phase3_dock(
+            "BotFleetDock",
+            "Bot Fleet",
+            phase2_widgets[2],
+            Qt.DockWidgetArea.RightDockWidgetArea,
+        )
+        self.strategy_lab_dock = self._create_phase3_dock(
+            "BotStrategyLabDock",
+            "Bot Strategy Lab / Backtester",
+            self.strategy_lab_panel,
+            Qt.DockWidgetArea.BottomDockWidgetArea,
+        )
+
+        self.phase3_docks: dict[str, QDockWidget] = {
+            "live_chart_execution": self.live_chart_dock,
+            "decision_audit": self.decision_audit_dock,
+            "quant_controls": self.quant_controls_dock,
+            "l2_orderbook": self.l2_orderbook_dock,
+            "bot_fleet": self.bot_fleet_dock,
+            "strategy_lab": self.strategy_lab_dock,
+        }
+        self.dock_widgets = self.phase3_docks
+        self.setDockOptions(
+            QMainWindow.DockOption.AllowNestedDocks
+            | QMainWindow.DockOption.AllowTabbedDocks
+            | QMainWindow.DockOption.AnimatedDocks
+        )
+
+        # Keep the main chart/execution surface prominent on first launch. A
+        # saved QSettings state overrides these defaults below.
+        if not self._workspace_settings.contains("ui/state"):
+            self.resizeDocks(
+                [self.live_chart_dock, self.quant_controls_dock, self.bot_fleet_dock],
+                [860, 360, 300],
+                Qt.Orientation.Horizontal,
+            )
+            self.resizeDocks(
+                [self.decision_audit_dock, self.strategy_lab_dock],
+                [280, 300],
+                Qt.Orientation.Vertical,
+            )
+
+    def _build_phase3_menus(self) -> None:
+        menu_bar = self.menuBar()
+        menu_bar.setObjectName("Phase3MenuBar")
+        menu_bar.setNativeMenuBar(False)
+
+        self.file_menu = menu_bar.addMenu("File")
+        self.view_menu = menu_bar.addMenu("View")
+        self.insert_menu = menu_bar.addMenu("Insert")
+        self.strategy_tools_menu = menu_bar.addMenu("Strategy Tools")
+        self.bot_lab_menu = menu_bar.addMenu("Bot Lab")
+        self.help_menu = menu_bar.addMenu("Help")
+
+        self.export_audit_json_action = QAction("Export Audit Telemetry JSON", self)
+        self.export_audit_json_action.triggered.connect(lambda: self.export_audit_telemetry_json())
+        self.export_audit_csv_action = QAction("Export Audit Telemetry CSV", self)
+        self.export_audit_csv_action.triggered.connect(lambda: self.export_audit_telemetry_csv())
+        self.save_workspace_layout_action = QAction("Save Workspace Layout", self)
+        self.save_workspace_layout_action.triggered.connect(lambda: self.save_workspace_layout())
+        self.exit_action = QAction("Exit", self)
+        self.exit_action.triggered.connect(lambda: self.close())
+        self.file_menu.addAction(self.export_audit_json_action)
+        self.file_menu.addAction(self.export_audit_csv_action)
+        self.file_menu.addSeparator()
+        self.file_menu.addAction(self.save_workspace_layout_action)
+        self.file_menu.addSeparator()
+        self.file_menu.addAction(self.exit_action)
+
+        self.view_actions: dict[str, QAction] = {}
+        for key, dock in self.phase3_docks.items():
+            action = dock.toggleViewAction()
+            action.setText(dock.windowTitle())
+            self.view_actions[key] = action
+            self.view_menu.addAction(action)
+        self.view_menu.addSeparator()
+        self.show_all_panels_action = QAction("Show All Panels", self)
+        self.show_all_panels_action.triggered.connect(lambda: self.show_all_phase3_panels())
+        self.hide_all_panels_action = QAction("Hide All Panels", self)
+        self.hide_all_panels_action.triggered.connect(lambda: self.hide_all_phase3_panels())
+        self.restore_workspace_layout_action = QAction("Restore Workspace Layout", self)
+        self.restore_workspace_layout_action.triggered.connect(lambda: self.restore_workspace_layout())
+        self.view_menu.addAction(self.show_all_panels_action)
+        self.view_menu.addAction(self.hide_all_panels_action)
+        self.view_menu.addAction(self.restore_workspace_layout_action)
+
+        self.insert_actions: dict[str, QAction] = {}
+        for label in ("Indicator: RSI", "Indicator: EMA", "Overlay: VWAP", "Custom Signal Widget"):
+            action = QAction(label, self)
+            action.triggered.connect(lambda _checked=False, item=label: self._insert_phase3_placeholder(item))
+            self.insert_menu.addAction(action)
+            self.insert_actions[label] = action
+        self.insert_menu.addSeparator()
+        self.indicators_menu = self.insert_menu.addMenu("Indicators")
+        for label in ("RSI", "EMA", "ATR"):
+            action = QAction(label, self)
+            action.triggered.connect(lambda _checked=False, item=f"Indicator: {label}": self._insert_phase3_placeholder(item))
+            self.indicators_menu.addAction(action)
+        self.overlays_menu = self.insert_menu.addMenu("Overlays")
+        for label in ("VWAP", "Session Bands", "Liquidity Levels"):
+            action = QAction(label, self)
+            action.triggered.connect(lambda _checked=False, item=f"Overlay: {label}": self._insert_phase3_placeholder(item))
+            self.overlays_menu.addAction(action)
+        self.custom_signal_widgets_menu = self.insert_menu.addMenu("Custom Signal Widgets")
+        self.custom_signal_widget_action = QAction("New Signal Widget", self)
+        self.custom_signal_widget_action.triggered.connect(
+            lambda: self._insert_phase3_placeholder("Custom Signal Widget")
+        )
+        self.custom_signal_widgets_menu.addAction(self.custom_signal_widget_action)
+
+        self.strategy_backtester_action = QAction("Strategy Backtester", self)
+        self.strategy_backtester_action.triggered.connect(lambda: self.show_strategy_backtester())
+        self.manual_risk_override_action = QAction("Manual Risk Override", self)
+        self.manual_risk_override_action.triggered.connect(lambda: self.show_manual_risk_override())
+        self.github_quant_module_search_action = QAction("GitHub Quant Module Search", self)
+        self.github_quant_module_search_action.triggered.connect(lambda: self.show_github_quant_module_search())
+        self.strategy_tools_menu.addAction(self.strategy_backtester_action)
+        self.strategy_tools_menu.addAction(self.manual_risk_override_action)
+        self.strategy_tools_menu.addAction(self.github_quant_module_search_action)
+        self.tools_menu = self.strategy_tools_menu.addMenu("Tools")
+        self.tools_menu.addAction(self.strategy_backtester_action)
+        self.tools_menu.addAction(self.manual_risk_override_action)
+        self.tools_menu.addAction(self.github_quant_module_search_action)
+
+        self.open_strategy_lab_action = QAction("Open Strategy Lab", self)
+        self.open_strategy_lab_action.triggered.connect(lambda: self.show_strategy_lab())
+        self.bot_lab_menu.addAction(self.open_strategy_lab_action)
+
+        self.about_action = QAction("About New Era Trading Bot", self)
+        self.about_action.triggered.connect(
+            lambda: self.status_message_label.setText(
+                "New Era Trading Bot Phase 3 native workspace — safe research and audit tooling."
+            )
+        )
+        self.phase3_help_action = QAction("Phase 3 UI Guide", self)
+        self.phase3_help_action.triggered.connect(
+            lambda: self.status_message_label.setText(
+                "Use View to toggle docks, Bot Lab for Strategy Lab, and File to export audit telemetry."
+            )
+        )
+        self.help_menu.addAction(self.about_action)
+        self.help_menu.addAction(self.phase3_help_action)
+
+    def _on_strategy_lab_tool_requested(self, tool: str) -> None:
+        self.status_message_label.setText(f"Strategy Lab: {tool.replace('.', ' ').replace('_', ' ')}")
+        if tool == "strategy.list":
+            self._spawn_http_task("strategies_list", "GET", "/strategies", timeout=12.0)
+        if tool == "risk.override":
+            controls = self.phase2_controls_tab.values()
+            controls["risk_pct"] = round(float(self.strategy_lab_panel.risk_override_spin.value()), 1)
+            self._apply_phase2_controls(controls)
+
+    def _insert_phase3_placeholder(self, label: str) -> None:
+        self.strategy_lab_panel.insert_placeholder(label)
+        self._show_dock(self.strategy_lab_dock)
+
+    def _show_dock(self, dock: QDockWidget) -> None:
+        dock.show()
+        dock.raise_()
+
+    def show_strategy_lab(self) -> None:
+        self._show_dock(self.strategy_lab_dock)
+        self.strategy_lab_panel.open_strategy_lab()
+
+    def show_strategy_backtester(self) -> None:
+        self._show_dock(self.strategy_lab_dock)
+        self.strategy_lab_panel.open_backtester()
+
+    def show_manual_risk_override(self) -> None:
+        self._show_dock(self.strategy_lab_dock)
+        self.strategy_lab_panel.open_manual_risk_override()
+
+    def show_github_quant_module_search(self) -> None:
+        self._show_dock(self.strategy_lab_dock)
+        self.strategy_lab_panel.open_github_module_search()
+
+    @staticmethod
+    def _strategy_data_path(symbol: str) -> str:
+        """Map a visible symbol to an existing workspace-local OHLCV CSV."""
+
+        normalized = symbol.strip().upper()
+        aliases = {
+            "GOLD": "xauusd",
+            "XAUUSD": "xauusd",
+            "EURUSD": "eurusd",
+            "GBPUSD": "gbpusd",
+            "USDJPY": "usdjpy",
+            "USDCAD": "usdcad",
+            "US500": "us500",
+            "USTEC": "ustec",
+            "NAS100": "ustec",
+            "BTCUSD": "btcusd",
+            "ETHUSD": "ethusd",
+            "VIX": "vix_x6",
+        }
+        stem = aliases.get(normalized, re.sub(r"[^A-Z0-9]+", "", normalized).lower() or "xauusd")
+        candidate = Path("TradingAgentsData") / "market" / f"{stem}_m5.csv"
+        if not (WORKSPACE_ROOT / candidate).is_file():
+            candidate = Path("TradingAgentsData") / "market" / "xauusd_m5.csv"
+        return candidate.as_posix()
+
+    def _request_strategy_save(self, payload: dict[str, Any]) -> None:
+        self._spawn_http_task("strategy_save", "POST", "/strategies", payload=dict(payload), timeout=15.0)
+
+    def _request_strategy_load(self, payload: dict[str, Any]) -> None:
+        self._spawn_http_task("strategy_load", "POST", "/strategies/load", payload=dict(payload), timeout=15.0)
+
+    def _request_strategy_backtest(self, payload: dict[str, Any]) -> None:
+        request = dict(payload)
+        symbol = str(request.pop("symbol", "XAUUSD")).strip().upper() or "XAUUSD"
+        request.pop("timeframe", None)
+        request.setdefault("data_path", self._strategy_data_path(symbol))
+        self._spawn_http_task("strategy_backtest", "POST", "/strategies/backtest", payload=request, timeout=60.0)
+
+    def _request_strategy_walk_forward(self, payload: dict[str, Any]) -> None:
+        request = dict(payload)
+        symbol = str(request.pop("symbol", "XAUUSD")).strip().upper() or "XAUUSD"
+        request.pop("timeframe", None)
+        request.setdefault("data_path", self._strategy_data_path(symbol))
+        self._spawn_http_task("strategy_walk_forward", "POST", "/strategies/walk-forward", payload=request, timeout=60.0)
+
+    def show_all_phase3_panels(self) -> None:
+        for dock in self.phase3_docks.values():
+            dock.show()
+        self.status_message_label.setText("All Phase 3 workspace panels shown.")
+
+    def hide_all_phase3_panels(self) -> None:
+        for dock in self.phase3_docks.values():
+            dock.hide()
+        self.status_message_label.setText("All Phase 3 workspace panels hidden; use View to restore one.")
+
+    def save_workspace_layout(self) -> None:
+        self._workspace_settings.setValue("ui/geometry", self.saveGeometry())
+        self._workspace_settings.setValue(
+            "ui/state",
+            self.saveState(self._workspace_layout_version),
+        )
+        self._workspace_settings.setValue("ui/theme", self._current_theme_name)
+        self._workspace_settings.sync()
+        if hasattr(self, "status_message_label"):
+            self.status_message_label.setText("Workspace layout saved to QSettings.")
+
+    def restore_workspace_layout(self) -> bool:
+        restored = False
+        geometry = self._workspace_settings.value("ui/geometry")
+        if geometry is not None:
+            restored = bool(self.restoreGeometry(geometry)) or restored
+        state = self._workspace_settings.value("ui/state")
+        if state is not None:
+            restored = bool(self.restoreState(state, self._workspace_layout_version)) or restored
+        if hasattr(self, "status_message_label"):
+            self.status_message_label.setText(
+                "Workspace layout restored from QSettings." if restored else "No saved workspace layout found."
+            )
+        return restored
+
+    def _restore_workspace_layout(self) -> None:
+        # Do not change the current theme during construction; the theme combo
+        # remains the user-controlled source of truth. Layout restoration is
+        # safe even when QSettings contains data from an older build.
+        self.restore_workspace_layout()
+
+    def _audit_telemetry_payload(self) -> dict[str, Any]:
+        records = self.phase2_audit_tab.records if hasattr(self, "phase2_audit_tab") else []
+        return {
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "event_count": int(self._event_count),
+            "ws_status": self._ws_status_text,
+            "ws_ping_ms": self._ws_ping_ms,
+            "active_bot_count": int(self._active_bot_count),
+            "mt5_connected": bool(self._latest_mt5_account),
+            "controls": self.phase2_controls_tab.values() if hasattr(self, "phase2_controls_tab") else {},
+            "summary": dict(getattr(self.phase2_audit_tab, "_summary", {}) or {}),
+            "records": records,
+        }
+
+    @staticmethod
+    def _resolve_export_path(
+        parent: QWidget,
+        path: str | Path | None,
+        title: str,
+        file_filter: str,
+        suffix: str,
+    ) -> Path | None:
+        if path is None:
+            selected, _ = QFileDialog.getSaveFileName(parent, title, f"audit_telemetry{suffix}", file_filter)
+            if not selected:
+                return None
+            output = Path(selected)
+        else:
+            output = Path(str(path))
+        if output.suffix.lower() != suffix.lower():
+            output = output.with_suffix(suffix)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        return output
+
+    def export_audit_telemetry_json(self, path: str | Path | None = None) -> Path | None:
+        output = self._resolve_export_path(
+            self,
+            path,
+            "Export Audit Telemetry JSON",
+            "JSON files (*.json)",
+            ".json",
+        )
+        if output is None:
+            return None
+        output.write_text(json.dumps(self._audit_telemetry_payload(), indent=2, ensure_ascii=False), encoding="utf-8")
+        self.status_message_label.setText(f"Audit telemetry exported to {output.name}.")
+        return output
+
+    def export_audit_telemetry_csv(self, path: str | Path | None = None) -> Path | None:
+        output = self._resolve_export_path(
+            self,
+            path,
+            "Export Audit Telemetry CSV",
+            "CSV files (*.csv)",
+            ".csv",
+        )
+        if output is None:
+            return None
+        records = self._audit_telemetry_payload()["records"]
+        fieldnames = [
+            "record_id",
+            "timestamp",
+            "symbol",
+            "signal",
+            "action",
+            "final_decision",
+            "execution_mode",
+            "reason",
+            "block_reason",
+        ]
+        with output.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for record in records:
+                if isinstance(record, dict):
+                    writer.writerow({name: record.get(name, "") for name in fieldnames})
+        self.status_message_label.setText(f"Audit telemetry exported to {output.name}.")
+        return output
+
+    def _build_execution_workspace_content(self) -> QSplitter:
+        """Build the unchanged chart/MT5 command surface for Phase 2 Tab 1."""
+
+        main_splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        main_splitter.addWidget(self._build_tradingview_chart_panel())
+        main_splitter.addWidget(self._build_right_command_tabs())
+        main_splitter.setStretchFactor(0, 56)
+        main_splitter.setStretchFactor(1, 44)
+        main_splitter.setSizes([930, 720])
+        return main_splitter
 
     def _build_header_panel(self) -> QFrame:
         header = QFrame(self)
@@ -1679,6 +2241,81 @@ class NewEraDesktopTerminal(QMainWindow):
             btn.setChecked(code == tv_code)
         symbol = self.ticker_combo.currentText().strip() or "XAUUSD"
         self._reload_tradingview_chart(symbol, tv_code)
+
+    # -----------------------------------------------------------------------
+    # Phase 2 Modular Workspace Bridges
+    # -----------------------------------------------------------------------
+    def _sync_phase2_symbol_selector(self, symbol: str) -> None:
+        if not hasattr(self, "phase2_live_tab"):
+            return
+        normalized = symbol.strip().upper() or "XAUUSD"
+        self.phase2_live_tab.set_symbol(normalized)
+
+    def _on_phase2_symbol_changed(self, symbol: str) -> None:
+        normalized = symbol.strip().upper()
+        if not normalized:
+            return
+        if self.ticker_combo.currentText().strip().upper() == normalized:
+            return
+        self._syncing_phase2_symbol = True
+        try:
+            self.ticker_combo.setCurrentText(normalized)
+        finally:
+            self._syncing_phase2_symbol = False
+
+    def _on_phase2_live_refresh_requested(self, symbol: str) -> None:
+        normalized = symbol.strip().upper() or "XAUUSD"
+        self._spawn_http_task("mt5_symbol", "GET", f"/mt5/symbol/{urllib.parse.quote(normalized)}")
+        self._request_open_positions(normalized)
+        self._request_l2_book(normalized, publish=False)
+
+    def _apply_phase2_controls(self, controls: dict[str, Any]) -> None:
+        if hasattr(self, "phase2_controls_tab"):
+            self.phase2_controls_tab.set_status("Applying controls to API…")
+        self.status_message_label.setText("Applying Quant Gate runtime controls…")
+        self._spawn_http_task(
+            "controls_update",
+            "POST",
+            "/controls",
+            payload=dict(controls),
+            timeout=8.0,
+        )
+
+    def _request_controls_state(self) -> None:
+        self._spawn_http_task("controls_get", "GET", "/controls", timeout=8.0)
+
+    def _request_decision_history(self, limit: int | None = None) -> None:
+        requested = int(limit or self.phase2_audit_tab.history_limit_spin.value())
+        requested = max(1, min(500, requested))
+        self._spawn_http_task(
+            "decision_history",
+            "GET",
+            f"/decision-history?limit={requested}",
+            timeout=10.0,
+        )
+        self._spawn_http_task("decision_history_summary", "GET", "/decision-history/summary", timeout=10.0)
+
+    def _handle_bot_fleet_action(self, action: str, payload: dict[str, Any]) -> None:
+        """Persist a fleet action through the safe bot-registry API."""
+
+        bot_id = str(payload.get("bot_id") or "").strip()
+        if action == "add":
+            self._spawn_http_task("bots_add", "POST", "/bots", payload=payload, timeout=8.0)
+            return
+        if not bot_id:
+            self.phase2_fleet_tab.set_action_status("Fleet action needs a bot id.", error=True)
+            return
+        encoded_id = urllib.parse.quote(bot_id, safe="")
+        if action == "set_enabled":
+            self._spawn_http_task(
+                "bot_enabled",
+                "POST",
+                f"/bots/{encoded_id}/enabled",
+                payload={"enabled": bool(payload.get("enabled"))},
+                timeout=8.0,
+            )
+        elif action == "remove":
+            self._spawn_http_task("bot_remove", "DELETE", f"/bots/{encoded_id}", timeout=8.0)
 
 
     # -----------------------------------------------------------------------
@@ -3026,6 +3663,11 @@ class NewEraDesktopTerminal(QMainWindow):
         self.auto_scan_timer = QTimer(self)
         self.auto_scan_timer.timeout.connect(self._trigger_scheduled_auto_scan)
 
+        self.ws_ping_timer = QTimer(self)
+        self.ws_ping_timer.setInterval(1000)
+        self.ws_ping_timer.timeout.connect(self._refresh_ws_ping_ui)
+        self.ws_ping_timer.start()
+
         self.ws_thread = WebSocketStreamThread(self.ws_url, self)
         self.ws_thread.ws_status_changed.connect(self._on_ws_status_changed)
         self.ws_thread.event_received.connect(self._on_ws_event_received)
@@ -3064,6 +3706,8 @@ class NewEraDesktopTerminal(QMainWindow):
 
     def refresh_all_state(self) -> None:
         self._update_session_indicator_ui()
+        self._request_controls_state()
+        self._request_decision_history()
         self._spawn_http_task("health", "GET", "/health")
         self._spawn_http_task("mt5_status", "GET", "/mt5/status")
         symbol = self.ticker_combo.currentText().strip() or "XAUUSD"
@@ -3072,6 +3716,7 @@ class NewEraDesktopTerminal(QMainWindow):
         self._request_trade_history()
         self._request_l2_book(symbol, publish=False)
         self._spawn_http_task("bots_status", "GET", "/bots/status")
+        self._spawn_http_task("strategies_list", "GET", "/strategies", timeout=12.0)
         self._spawn_http_task(
             "gates_latest",
             "GET",
@@ -3084,6 +3729,8 @@ class NewEraDesktopTerminal(QMainWindow):
 
     def _poll_periodic_state(self) -> None:
         self._update_session_indicator_ui()
+        self._request_controls_state()
+        self._request_decision_history()
         self._spawn_http_task("health", "GET", "/health")
         self._spawn_http_task("mt5_status", "GET", "/mt5/status")
         symbol = self.ticker_combo.currentText().strip() or "XAUUSD"
@@ -3218,6 +3865,16 @@ class NewEraDesktopTerminal(QMainWindow):
     def _on_http_succeeded(self, task_name: str, data: object) -> None:
         if task_name == "health" and isinstance(data, dict):
             self._update_health_ui(data)
+        elif task_name == "controls_get" and isinstance(data, dict):
+            self._update_phase2_controls_ui(data)
+        elif task_name == "controls_update" and isinstance(data, dict):
+            self._update_phase2_controls_ui(data)
+            self.phase2_controls_tab.set_status("Runtime controls applied.")
+            self.status_message_label.setText("Quant Gate runtime controls applied.")
+        elif task_name == "decision_history" and isinstance(data, dict):
+            self._update_decision_history_ui(data)
+        elif task_name == "decision_history_summary" and isinstance(data, dict):
+            self.phase2_audit_tab.set_summary(data)
         elif task_name == "mt5_status" and isinstance(data, dict):
             self._update_mt5_status_ui(data)
         elif task_name == "mt5_symbol" and isinstance(data, dict):
@@ -3263,6 +3920,16 @@ class NewEraDesktopTerminal(QMainWindow):
             self._update_l2_orderbook_ui(data)
         elif task_name == "bots_status" and isinstance(data, dict):
             self._update_bots_ui(data)
+        elif task_name == "strategies_list" and isinstance(data, dict):
+            self.strategy_lab_panel.set_strategy_profiles(data)
+        elif task_name in {"strategy_save", "strategy_load", "strategy_backtest", "strategy_walk_forward"} and isinstance(data, dict):
+            self.strategy_lab_panel.set_backend_result(task_name, data)
+            if task_name == "strategy_save":
+                self._spawn_http_task("strategies_list", "GET", "/strategies", timeout=12.0)
+            self.status_message_label.setText(f"Strategy Lab {task_name.replace('_', ' ')} completed.")
+        elif task_name in {"bots_add", "bot_enabled", "bot_remove"}:
+            self.phase2_fleet_tab.set_action_status("Fleet action applied; registry refreshed.")
+            self._spawn_http_task("bots_status", "GET", "/bots/status", timeout=8.0)
         elif task_name == "gates_latest" and isinstance(data, dict):
             self._update_gates_and_prediction_ui(data)
         elif task_name in {"scan_manual", "scan_automatic"} and isinstance(data, dict):
@@ -3357,7 +4024,20 @@ class NewEraDesktopTerminal(QMainWindow):
         if task_name == "health":
             self.api_status_badge.setText("● API OFFLINE")
             self._apply_pill_style(self.api_status_badge, "offline")
+            self.status_api_label.setText("API: OFFLINE")
             self.status_message_label.setText(f"API unreachable ({self.api_url}): {error_text}")
+        elif task_name in {"strategies_list", "strategy_save", "strategy_load", "strategy_backtest", "strategy_walk_forward"}:
+            self.strategy_lab_panel.set_backend_error(task_name, error_text)
+            self.status_message_label.setText(f"Strategy Lab request failed: {error_text}")
+        elif task_name in {"controls_get", "controls_update"}:
+            self.phase2_controls_tab.set_status(f"Controls API offline: {error_text}", error=True)
+            if task_name == "controls_update":
+                self.status_message_label.setText("Quant Gate controls kept as local UI state; API is offline.")
+        elif task_name in {"decision_history", "decision_history_summary"}:
+            self.status_message_label.setText("Decision audit API offline; showing the last local view.")
+        elif task_name in {"bots_add", "bot_enabled", "bot_remove"}:
+            self.phase2_fleet_tab.set_action_status(f"Fleet API action failed: {error_text}", error=True)
+            self.status_message_label.setText(f"Fleet action failed: {error_text}")
         elif task_name in {"scan_manual", "scan_automatic"}:
             self.btn_manual_scan.setEnabled(True)
             self.btn_manual_scan.setText("▶ SCAN SYMBOL (MT5 → AI)")
@@ -3393,6 +4073,7 @@ class NewEraDesktopTerminal(QMainWindow):
         version = data.get("version", "0.1.0")
         self.api_status_badge.setText(f"● API ONLINE v{version}")
         self._apply_pill_style(self.api_status_badge, "online")
+        self.status_api_label.setText(f"API: ONLINE v{version}")
 
         gemini_obj = data.get("gemini") if isinstance(data.get("gemini"), dict) else {}
         if gemini_obj.get("live"):
@@ -3428,6 +4109,23 @@ class NewEraDesktopTerminal(QMainWindow):
             self.memory_status_badge.setText(f"MEMORY: {backend}{count_str}")
             self._apply_pill_style(self.memory_status_badge, "info")
 
+        controls = data.get("controls")
+        if isinstance(controls, dict):
+            self._update_phase2_controls_ui(controls)
+
+    def _update_phase2_controls_ui(self, data: dict[str, Any]) -> None:
+        if not isinstance(data, dict):
+            return
+        self.phase2_controls_tab.set_state(data)
+        source = data.get("metadata", {}).get("source") if isinstance(data.get("metadata"), dict) else None
+        if source:
+            self.phase2_controls_tab.set_status(f"Loaded controls from API ({source}).")
+
+    def _update_decision_history_ui(self, data: dict[str, Any]) -> None:
+        if not isinstance(data, dict):
+            return
+        self.phase2_audit_tab.update_records(data)
+
 
     def _update_mt5_status_ui(self, data: dict[str, Any]) -> None:
         connected = bool(data.get("connected", False))
@@ -3456,6 +4154,7 @@ class NewEraDesktopTerminal(QMainWindow):
 
             self.mt5_status_badge.setText(f"● MT5: {server}")
             self._apply_pill_style(self.mt5_status_badge, "online")
+            self.status_mt5_health_label.setText(f"MT5 HEALTH: OK ({server})")
             self.mt5_broker_value.setText(f"{company} ({server})")
             self.mt5_account_value.setText(f"#{login} [{trade_mode}] — {acc.get('name', '')}")
             self.mt5_balance_value.setText(f"{currency} {balance:,.2f}  |  Eq: {equity:,.2f}")
@@ -3486,6 +4185,7 @@ class NewEraDesktopTerminal(QMainWindow):
             err = str(data.get("error") or "Offline")
             self.mt5_status_badge.setText("● MT5 OFFLINE")
             self._apply_pill_style(self.mt5_status_badge, "offline")
+            self.status_mt5_health_label.setText("MT5 HEALTH: OFFLINE")
             self.mt5_broker_value.setText(f"MT5 Not Connected ({err[:36]})")
 
     def _update_mt5_symbol_ui(self, data: dict[str, Any]) -> None:
@@ -3504,6 +4204,10 @@ class NewEraDesktopTerminal(QMainWindow):
             f"{sym}  •  BID: {bid:.{digits}f}  |  ASK: {ask:.{digits}f}  |  "
             f"SPREAD: {spread:.1f} pts  |  M5 ATR: {atr_m5:.{digits}f}"
         )
+        if hasattr(self, "phase2_live_tab"):
+            self.phase2_live_tab.set_quote_status(
+                f"{sym}  BID {bid:.{digits}f}  |  ASK {ask:.{digits}f}  |  ATR {atr_m5:.{digits}f}"
+            )
         if spread > 0 and not self.spread_spin.hasFocus():
             self.spread_spin.setValue(spread)
 
@@ -3660,6 +4364,47 @@ class NewEraDesktopTerminal(QMainWindow):
         for alert_item in alerts_list:
             if isinstance(alert_item, dict):
                 self._append_l2_alert(alert_item)
+        self._update_phase3_l2_dock(data, symbol=symbol, digits=digits)
+
+    def _update_phase3_l2_dock(self, data: dict[str, Any], *, symbol: str, digits: int) -> None:
+        """Render a compact HFT-style L2 telemetry view in the dock panel."""
+
+        panel = getattr(self, "l2_orderbook_panel", None)
+        if panel is None:
+            return
+        best_bid = self._safe_float(data.get("best_bid", 0.0))
+        best_ask = self._safe_float(data.get("best_ask", 0.0))
+        mid_price = self._safe_float(data.get("mid_price", (best_bid + best_ask) / 2.0))
+        spread = self._safe_float(data.get("spread", max(0.0, best_ask - best_bid)))
+        bid_pct = self._safe_float(data.get("bid_pressure_pct", 50.0))
+        ask_pct = self._safe_float(data.get("ask_pressure_pct", 50.0))
+        imbalance = self._safe_float(data.get("imbalance_ratio", 1.0))
+        direction = str(data.get("l2_direction") or "NEUTRAL").upper()
+        source = str(data.get("source") or "mt5_l2_dom")
+        veto = bool(data.get("veto_buy") or data.get("veto_sell"))
+        veto_reason = str(data.get("veto_reason") or "CLEAR")
+        buy_wall = data.get("nearest_buy_wall") or data.get("strongest_buy_wall") or {}
+        sell_wall = data.get("nearest_sell_wall") or data.get("strongest_sell_wall") or {}
+        alerts = data.get("alerts") if isinstance(data.get("alerts"), list) else []
+        alert_lines = [
+            str(item.get("message") or item.get("alert_type") or "alert")
+            for item in alerts[-5:]
+            if isinstance(item, dict)
+        ]
+        lines = [
+            f"L2 ORDERBOOK / DOM TELEMETRY — {symbol}",
+            f"SOURCE: {source}    DIRECTION: {direction}    GATE: {'VETO' if veto else 'CLEAR'}",
+            f"BEST BID: {best_bid:.{digits}f}    MID: {mid_price:.{digits}f}    BEST ASK: {best_ask:.{digits}f}",
+            f"SPREAD: {spread:.{digits}f}    IMBALANCE: {imbalance:+.2f}",
+            f"BID PRESSURE: {bid_pct:.1f}%    ASK PRESSURE: {ask_pct:.1f}%",
+            f"BUY WALL: {buy_wall.get('price', '--')} / {buy_wall.get('volume', '--')}",
+            f"SELL WALL: {sell_wall.get('price', '--')} / {sell_wall.get('volume', '--')}",
+            f"VETO REASON: {veto_reason}",
+        ]
+        if alert_lines:
+            lines.append("RECENT ALERTS:")
+            lines.extend(f"  • {line}" for line in alert_lines)
+        panel.setPlainText("\n".join(lines))
 
     def _populate_dom_row(
         self,
@@ -3773,6 +4518,21 @@ class NewEraDesktopTerminal(QMainWindow):
     def _update_bots_ui(self, data: dict[str, Any]) -> None:
         active_id = str(data.get("active_bot") or "unknown")
         bots = data.get("bots") or []
+        active_count = 0
+        for bot in bots:
+            if not isinstance(bot, dict):
+                continue
+            enabled_value = bot.get("enabled")
+            if isinstance(enabled_value, bool):
+                enabled = enabled_value
+            else:
+                enabled = str(bot.get("status") or "enabled").lower() not in {"disabled", "off"}
+            if enabled:
+                active_count += 1
+        if active_count == 0 and not bots and active_id != "unknown":
+            active_count = 1
+        self._active_bot_count = active_count
+        self.status_active_bot_label.setText(f"ACTIVE BOTS: {active_count}")
         display_name = active_id
         bot_status = "demo_only"
         for bot in bots:
@@ -3782,6 +4542,8 @@ class NewEraDesktopTerminal(QMainWindow):
                 break
         self.active_bot_value.setText(display_name)
         self.bot_mode_value.setText(f"{bot_status.upper()} [SAFE DEMO]")
+        if hasattr(self, "phase2_fleet_tab"):
+            self.phase2_fleet_tab.set_status(data)
 
     def _update_gates_and_prediction_ui(self, data: dict[str, Any]) -> None:
         active_symbol = self.ticker_combo.currentText().strip().upper() or "XAUUSD"
@@ -4156,11 +4918,64 @@ class NewEraDesktopTerminal(QMainWindow):
     # -----------------------------------------------------------------------
     # WebSocket Event Stream Handling
     # -----------------------------------------------------------------------
+    def _record_ws_latency(self, message: dict[str, Any]) -> None:
+        """Record a safe UI-side latency sample from an incoming WS event.
+
+        The API already stamps stream events.  Comparing that stamp with the
+        local receipt time gives a dependency-free telemetry estimate and keeps
+        the UI responsive when no extra network ping task is available.
+        """
+
+        self._last_ws_event_monotonic = time.monotonic()
+        timestamp = message.get("timestamp")
+        try:
+            age_ms = (time.time() - float(timestamp)) * 1000.0
+        except (TypeError, ValueError):
+            age_ms = 0.0
+        if 0.0 <= age_ms <= 60_000.0:
+            self._ws_ping_ms = round(age_ms, 1)
+            self._last_ws_ping_sample_monotonic = time.monotonic()
+        else:
+            self._ws_ping_ms = None
+            self._last_ws_ping_sample_monotonic = None
+        self._refresh_ws_ping_ui()
+
+    def _refresh_ws_ping_ui(self) -> None:
+        if not hasattr(self, "status_ws_ping_label"):
+            return
+        if not self._ws_connected:
+            self.status_ws_ping_label.setText("WS PING: --")
+            return
+        sample_age = (
+            time.monotonic() - self._last_ws_ping_sample_monotonic
+            if self._last_ws_ping_sample_monotonic is not None
+            else None
+        )
+        if self._ws_ping_ms is not None and (sample_age is None or sample_age <= 10.0):
+            self.status_ws_ping_label.setText(f"WS PING: {self._ws_ping_ms:.0f} ms")
+        elif self._last_ws_event_monotonic is None:
+            self.status_ws_ping_label.setText("WS PING: waiting")
+        else:
+            self.status_ws_ping_label.setText("WS PING: stale")
+
+    @property
+    def ws_ping_latency_ms(self) -> float | None:
+        """Latest UI-side WebSocket latency estimate in milliseconds."""
+
+        return self._ws_ping_ms
+
     def _on_ws_status_changed(self, connected: bool, status_text: str) -> None:
+        self._ws_connected = bool(connected)
+        self._ws_status_text = str(status_text or ("WS LIVE STREAM" if connected else "WS OFFLINE"))
+        if not connected:
+            self._ws_ping_ms = None
+            self._last_ws_ping_sample_monotonic = None
         self.ws_status_badge.setText(f"● {status_text}")
         self._apply_pill_style(self.ws_status_badge, "online" if connected else "warning")
+        self._refresh_ws_ping_ui()
 
     def _on_ws_event_received(self, message: dict[str, Any]) -> None:
+        self._record_ws_latency(message)
         self._event_count += 1
         self.event_counter_label.setText(f"EVENTS: {self._event_count}")
 
@@ -4173,6 +4988,46 @@ class NewEraDesktopTerminal(QMainWindow):
             else datetime.now().strftime("%H:%M:%S")
         )
 
+        if event_type == "trade.decision":
+            decision_record = payload.get("record") if isinstance(payload.get("record"), dict) else payload
+            if isinstance(decision_record, dict):
+                self.phase2_audit_tab.append_record(decision_record)
+                action = str(
+                    decision_record.get("final_decision")
+                    or decision_record.get("action")
+                    or payload.get("final_decision")
+                    or "ABSTAIN"
+                ).upper()
+                mode = str(decision_record.get("execution_mode") or payload.get("execution_mode") or "BLOCKED").upper()
+                reason = str(decision_record.get("reason") or decision_record.get("block_reason") or "decision recorded")
+                color = "#10b981" if mode == "LIVE" else ("#f59e0b" if mode == "SHADOW" else "#ef4444")
+                self._append_log_entry(
+                    self.log_all,
+                    "TRADE.DECISION",
+                    f"{decision_record.get('symbol', '--')} {action} [{mode}] — {reason}",
+                    color,
+                    time_str=time_str,
+                )
+                self._append_log_entry(
+                    self.log_system,
+                    "AUDIT",
+                    f"{decision_record.get('symbol', '--')} {action} [{mode}] — {reason}",
+                    color,
+                    time_str=time_str,
+                )
+            return
+        if event_type == "controls.changed":
+            controls = payload.get("controls") if isinstance(payload.get("controls"), dict) else payload
+            if isinstance(controls, dict):
+                self._update_phase2_controls_ui(controls)
+            self._append_log_entry(
+                self.log_all,
+                "CONTROLS",
+                str(payload.get("message") or "Runtime controls changed"),
+                "#38bdf8",
+                time_str=time_str,
+            )
+            return
         if event_type == "l2.snapshot":
             orderflow = payload.get("orderflow") if isinstance(payload.get("orderflow"), dict) else payload
             if isinstance(orderflow, dict):
@@ -4417,10 +5272,12 @@ class NewEraDesktopTerminal(QMainWindow):
     # Clean Shutdown
     # -----------------------------------------------------------------------
     def closeEvent(self, event_obj) -> None:  # type: ignore[override]
+        self.save_workspace_layout()
         self.poll_timer.stop()
         self.l2_timer.stop()
         self.pair_switch_scan_timer.stop()
         self.auto_scan_timer.stop()
+        self.ws_ping_timer.stop()
         if hasattr(self, "ws_thread") and self.ws_thread.isRunning():
             self.ws_thread.stop()
             self.ws_thread.wait(2500)

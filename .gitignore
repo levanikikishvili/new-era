@@ -27,6 +27,7 @@ KronosData/
 KronosData/hf-cache/
 *.log
 *.pid
+logs/
 
 # Build and packaging output.
 build/

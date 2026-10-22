@@ -85,6 +85,11 @@ class ApiSettings:
     chroma_collection: str = os.getenv("NEWERA_CHROMA_COLLECTION", "newera_trade_cycles")
     process_shell: str = os.getenv("NEWERA_POWERSHELL", "powershell")
     safe_mode: bool = _bool("NEWERA_SAFE_MODE", True)
+    screener_interval_seconds: int = max(1, int(os.getenv("NEWERA_SCREENER_INTERVAL_SECONDS", "15")))
+    decision_history_max_records: int = max(
+        1,
+        int(os.getenv("NEWERA_DECISION_HISTORY_MAX_RECORDS", "1000")),
+    )
 
     @property
     def gemini_key_configured(self) -> bool:
@@ -119,9 +124,14 @@ class ApiSettings:
     def combined_report_path(self) -> Path:
         return self.report_dir / "combined_gate_latest.json"
 
+    @property
+    def decision_history_path(self) -> Path:
+        return self.root / "logs" / "decision_history.json"
+
     def ensure_directories(self) -> None:
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self.report_dir.mkdir(parents=True, exist_ok=True)
+        self.decision_history_path.parent.mkdir(parents=True, exist_ok=True)
 
     def resolve_workspace_path(self, value: str | Path | None, *, default: Path | None = None) -> Path:
         """Resolve a request path and reject traversal outside this workspace."""

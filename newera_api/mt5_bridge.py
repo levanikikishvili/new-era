@@ -1274,6 +1274,7 @@ def _inprocess_manage_demo_positions(
     *,
     price_override: float | None = None,
     atr_override: float | None = None,
+    time_stop_minutes: int | None = None,
     now_override: datetime | None = None,
 ) -> dict[str, Any]:
     """Run Dynamic Position Management on all open Demo positions:
@@ -1291,7 +1292,13 @@ def _inprocess_manage_demo_positions(
         resolved_filter = _resolve_broker_symbol(mt5, symbol) if symbol else None
         modifications: list[dict[str, Any]] = []
         now_utc = _coerce_utc_datetime(now_override) or datetime.now(timezone.utc)
-        time_stop_minutes = _configured_time_stop_minutes()
+        configured_time_stop = _configured_time_stop_minutes()
+        if time_stop_minutes is not None:
+            try:
+                configured_time_stop = max(1, min(DEFAULT_TIME_STOP_MINUTES, int(time_stop_minutes)))
+            except (TypeError, ValueError):
+                configured_time_stop = _configured_time_stop_minutes()
+        time_stop_minutes = configured_time_stop
         time_stop_closed_tickets: list[int] = []
         time_stop_errors: list[str] = []
 
@@ -2437,6 +2444,7 @@ def manage_mt5_demo_positions(
     *,
     price_override: float | None = None,
     atr_override: float | None = None,
+    time_stop_minutes: int | None = None,
     now_override: datetime | None = None,
 ) -> dict[str, Any]:
     try:
@@ -2446,6 +2454,7 @@ def manage_mt5_demo_positions(
             symbol=symbol,
             price_override=price_override,
             atr_override=atr_override,
+            time_stop_minutes=time_stop_minutes,
             now_override=now_override,
         )
     except ImportError:
@@ -2456,6 +2465,8 @@ def manage_mt5_demo_positions(
             cli_args.extend(["--price-override", str(price_override)])
         if atr_override is not None:
             cli_args.extend(["--atr-override", str(atr_override)])
+        if time_stop_minutes is not None:
+            cli_args.extend(["--time-stop-minutes", str(time_stop_minutes)])
         return _call_bridge_cli(cli_args, timeout=15.0)
 
 
@@ -2526,6 +2537,7 @@ def _cli_main(argv: list[str] | None = None) -> int:
     parser.set_defaults(paper_fallback=False)
     parser.add_argument("--price-override", type=float, default=None)
     parser.add_argument("--atr-override", type=float, default=None)
+    parser.add_argument("--time-stop-minutes", type=int, default=None)
     args = parser.parse_args(argv)
 
     try:
@@ -2558,6 +2570,7 @@ def _cli_main(argv: list[str] | None = None) -> int:
                 symbol=sym,
                 price_override=args.price_override,
                 atr_override=args.atr_override,
+                time_stop_minutes=args.time_stop_minutes,
             )
         else:
             payload = _inprocess_export_bars(

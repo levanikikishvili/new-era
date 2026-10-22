@@ -21,27 +21,36 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import bot_manager
 from newera_api import __version__
+from newera_api.bot_lab import StrategyLab
 from newera_api.config import settings
 from newera_api.events import EventBus, event
 from newera_api.mt5_bridge import get_mt5_status, get_mt5_symbol_snapshot
 from newera_api.orchestrator import Orchestrator
 from newera_api.schemas import (
     AutonomousModeRequest,
+    BotEnabledRequest,
+    BotProfileCreateRequest,
+    ControlsUpdateRequest,
     DemoCloseRequest,
     DemoManageRequest,
     DemoOrderRequest,
     GeminiAnalyzeRequest,
     GeminiChatRequest,
     MemorySearchResponse,
+    BacktestRequest,
     ScanRequest,
     ScanResponse,
     ScanStatus,
+    StrategyLoadRequest,
+    StrategySaveRequest,
     TelegramCommandRequest,
+    WalkForwardRequest,
 )
 
 
 bus = EventBus()
 orchestrator = Orchestrator(settings, bus)
+strategy_lab = StrategyLab(settings)
 
 
 @asynccontextmanager
@@ -69,7 +78,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=list(settings.allow_origins),
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PUT"],
     allow_headers=["*"],
 )
 
@@ -94,7 +103,39 @@ async def health() -> dict[str, Any]:
         "active_scan_id": orchestrator._active_scan_id,
         "websocket_subscribers": bus.subscriber_count,
         "memory": orchestrator.memory.health(),
+        "controls": orchestrator.get_controls(),
+        "decision_history_summary": orchestrator.decision_history_summary(),
+        "decision_history_path": str(settings.decision_history_path),
     }
+
+
+@app.get("/controls")
+async def controls_get() -> dict[str, Any]:
+    """Return the normalized runtime decision profile and override metadata."""
+
+    return orchestrator.get_controls()
+
+
+@app.post("/controls")
+async def controls_post(request: ControlsUpdateRequest) -> dict[str, Any]:
+    """Apply a partial runtime decision-profile update and return its state."""
+
+    try:
+        return orchestrator.update_controls(request.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/decision-history")
+async def decision_history(
+    limit: int = Query(default=100, ge=1, le=5000),
+) -> dict[str, Any]:
+    return orchestrator.decision_history(limit)
+
+
+@app.get("/decision-history/summary")
+async def decision_history_summary() -> dict[str, Any]:
+    return orchestrator.decision_history_summary()
 
 
 @app.get("/mt5/status")
@@ -276,6 +317,7 @@ async def bots_status() -> dict[str, Any]:
                 "id": bot.get("id"),
                 "display_name": bot.get("display_name"),
                 "status": bot.get("status"),
+                "enabled": bot.get("enabled", str(bot.get("status") or "").lower() not in {"disabled", "off"}),
                 "symbol": bot.get("symbol"),
                 "safety": bot.get("safety", {}),
             }
@@ -287,6 +329,170 @@ async def bots_status() -> dict[str, Any]:
         "validation_errors": validation_errors,
         "real_account_allowed": False,
     }
+
+
+@app.post("/bots")
+async def bots_add(request: BotProfileCreateRequest) -> dict[str, Any]:
+    """Register a new research-only profile; no MT5 artifact is activated."""
+
+    try:
+        return bot_manager.add_bot_profile(
+            request.display_name,
+            bot_id=request.bot_id,
+            symbol=request.symbol,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/bots/{bot_id}/enabled")
+async def bots_set_enabled(bot_id: str, request: BotEnabledRequest) -> dict[str, Any]:
+    try:
+        return bot_manager.set_bot_enabled(bot_id, request.enabled)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.delete("/bots/{bot_id}")
+async def bots_remove(bot_id: str) -> dict[str, Any]:
+    try:
+        return bot_manager.remove_bot_profile(bot_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _strategy_profile_payload(request: StrategySaveRequest) -> dict[str, Any]:
+    payload = request.model_dump(exclude_none=True, by_alias=False)
+    # ``module_path`` and ``class_name`` are accepted as convenient top-level
+    # fields, while bot_lab persists them under the code descriptor.
+    if payload.get("module_path") or payload.get("class_name"):
+        code = dict(payload.get("code") or {})
+        if payload.get("module_path"):
+            code.setdefault("module_path", payload["module_path"])
+        if payload.get("class_name"):
+            code.setdefault("class_name", payload["class_name"])
+        payload["code"] = code
+    return payload
+
+
+def _strategy_bars(request: BacktestRequest) -> list[dict[str, Any]] | None:
+    rows = request.bars or request.ohlcv or request.data
+    if rows is None:
+        return None
+    return [item if isinstance(item, dict) else item.model_dump() for item in rows]
+
+
+def _strategy_target(request: BacktestRequest) -> str | dict[str, Any]:
+    profile = request.profile or request.strategy
+    if profile is not None:
+        return profile.model_dump(exclude_none=True, by_alias=False)
+    if request.strategy_id:
+        return request.strategy_id
+    raise HTTPException(status_code=422, detail="strategy_id or profile is required")
+
+
+@app.get("/strategies")
+async def strategies_list() -> dict[str, Any]:
+    profiles = await asyncio.to_thread(strategy_lab.list_profiles)
+    return {
+        "strategies": profiles,
+        "count": len(profiles),
+        "research_only": True,
+        "real_account_allowed": False,
+        "order_execution_allowed": False,
+    }
+
+
+@app.get("/strategies/{strategy_id}")
+async def strategies_get(strategy_id: str) -> dict[str, Any]:
+    try:
+        return await asyncio.to_thread(strategy_lab.load_profile, strategy_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/strategies")
+async def strategies_save(request: StrategySaveRequest) -> dict[str, Any]:
+    try:
+        return await asyncio.to_thread(strategy_lab.save_profile, _strategy_profile_payload(request))
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.put("/strategies/{strategy_id}")
+async def strategies_save_at(strategy_id: str, request: StrategySaveRequest) -> dict[str, Any]:
+    try:
+        return await asyncio.to_thread(
+            strategy_lab.save_profile,
+            _strategy_profile_payload(request),
+            strategy_id=strategy_id,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/strategies/backtest")
+async def strategies_backtest(request: BacktestRequest) -> dict[str, Any]:
+    target = _strategy_target(request)
+    try:
+        return await asyncio.to_thread(
+            strategy_lab.backtest,
+            target,
+            _strategy_bars(request),
+            data_path=request.data_path,
+            initial_cash=request.initial_cash,
+            position_size=request.position_size,
+            commission=request.commission,
+            slippage=request.slippage,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/strategies/walk-forward")
+async def strategies_walk_forward(request: WalkForwardRequest) -> dict[str, Any]:
+    target = _strategy_target(request)
+    try:
+        return await asyncio.to_thread(
+            strategy_lab.walk_forward,
+            target,
+            _strategy_bars(request),
+            data_path=request.data_path,
+            train_ratio=request.train_ratio,
+            train_bars=request.train_bars,
+            initial_cash=request.initial_cash,
+            position_size=request.position_size,
+            commission=request.commission,
+            slippage=request.slippage,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/strategies/load")
+async def strategies_load(request: StrategyLoadRequest) -> dict[str, Any]:
+    try:
+        loaded = await asyncio.to_thread(
+            strategy_lab.load_strategy,
+            strategy_id=request.strategy_id,
+            module_path=request.module_path,
+            class_name=request.class_name,
+        )
+        return loaded.metadata()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/gates/latest")

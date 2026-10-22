@@ -5,13 +5,18 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
+import re
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent
 REGISTRY_PATH = ROOT / "bot_registry.json"
+BOT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$")
+BOT_MUTABLE_STATUSES = {"research_only", "demo_only", "disabled"}
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -26,6 +31,102 @@ def load_json(path: Path) -> dict[str, Any]:
 
 def load_registry() -> dict[str, Any]:
     return load_json(REGISTRY_PATH)
+
+
+def _normalize_bot_id(value: str) -> str:
+    candidate = str(value or "").strip().lower().replace(" ", "-")
+    if not BOT_ID_PATTERN.fullmatch(candidate):
+        raise ValueError("bot id must be 2-64 characters using letters, numbers, '.', '_' or '-'")
+    return candidate
+
+
+def save_registry(registry: dict[str, Any], path: Path = REGISTRY_PATH) -> dict[str, Any]:
+    """Validate and atomically persist a registry without touching artifacts."""
+
+    errors = validate_registry(registry)
+    if errors:
+        raise ValueError("invalid bot registry: " + "; ".join(errors))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp_path.write_text(json.dumps(registry, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(temp_path, path)
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return registry
+
+
+def add_bot_profile(
+    display_name: str,
+    *,
+    bot_id: str | None = None,
+    symbol: str = "XAUUSD",
+    path: Path = REGISTRY_PATH,
+) -> dict[str, Any]:
+    """Add a safe research-only profile; no executable artifact is created."""
+
+    registry = load_json(path)
+    clean_name = str(display_name or "").strip()
+    if not clean_name or len(clean_name) > 120:
+        raise ValueError("display_name must be 1-120 characters")
+    normalized_id = _normalize_bot_id(bot_id or clean_name)
+    existing_ids = {
+        str(item.get("id"))
+        for item in registry.get("bots", [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    if normalized_id in existing_ids:
+        raise ValueError(f"bot is already registered: {normalized_id}")
+    normalized_symbol = str(symbol or "XAUUSD").strip().upper()
+    if not normalized_symbol or any(character not in set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+-") for character in normalized_symbol):
+        raise ValueError("symbol contains unsupported characters")
+    bot = {
+        "id": normalized_id,
+        "display_name": clean_name,
+        "status": "research_only",
+        "enabled": True,
+        "symbol": normalized_symbol,
+        "execution": {"kind": "research_profile", "source": None},
+        "research": {"kind": "local_profile", "output_directory": "TradingAgentsData/research"},
+        "safety": {"real_account_allowed": False, "direct_python_orders": False},
+    }
+    bots = registry.setdefault("bots", [])
+    if not isinstance(bots, list):
+        raise ValueError("registry bots must be a list")
+    bots.append(bot)
+    save_registry(registry, path)
+    return bot
+
+
+def set_bot_enabled(bot_id: str, enabled: bool, *, path: Path = REGISTRY_PATH) -> dict[str, Any]:
+    registry = load_json(path)
+    bot = bot_by_id(registry, _normalize_bot_id(bot_id))
+    bot["enabled"] = bool(enabled)
+    if not bot["enabled"]:
+        bot["status"] = "disabled"
+    elif str(bot.get("status") or "").lower() == "disabled":
+        bot["status"] = "research_only"
+    save_registry(registry, path)
+    return bot
+
+
+def remove_bot_profile(bot_id: str, *, path: Path = REGISTRY_PATH) -> dict[str, Any]:
+    registry = load_json(path)
+    normalized_id = _normalize_bot_id(bot_id)
+    if str(registry.get("active_bot")) == normalized_id:
+        raise ValueError("active bot cannot be removed; activate another profile first")
+    bots = registry.get("bots")
+    if not isinstance(bots, list) or len(bots) <= 1:
+        raise ValueError("the registry must keep at least one bot")
+    remaining = [item for item in bots if not (isinstance(item, dict) and item.get("id") == normalized_id)]
+    if len(remaining) == len(bots):
+        raise ValueError(f"bot is not registered: {normalized_id}")
+    registry["bots"] = remaining
+    save_registry(registry, path)
+    return {"id": normalized_id, "removed": True}
 
 
 def bot_by_id(registry: dict[str, Any], bot_id: str) -> dict[str, Any]:

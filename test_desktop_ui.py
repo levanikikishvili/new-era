@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import os
+import json
+import tempfile
+import time
 import unittest
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QDockWidget
+from newera_api.gui import BotStrategyLabPanel
 from ui.desktop_app import (
     NewEraDesktopTerminal,
     build_tradingview_html,
@@ -225,6 +229,7 @@ class DesktopUiTests(unittest.TestCase):
             self.assertIn("VETO BUY", window.l2_veto_badge.text())
             self.assertIn("SELL", window.l2_direction_badge.text())
             self.assertIn("WHALE SELL WALL", window.l2_alerts_feed.toPlainText())
+            self.assertIn("L2 ORDERBOOK / DOM TELEMETRY", window.l2_orderbook_panel.toPlainText())
             self.assertEqual(window.l2_dom_table.rowCount(), 21)
 
             # A delayed event for a different pair must not replace the active pair's L2 state.
@@ -621,6 +626,237 @@ class DesktopUiTests(unittest.TestCase):
             self.assertIn("WIN-PROB:", window.wf_prob_badge.text())
         finally:
             window.close()
+
+    def test_phase2_four_tab_workspace_and_control_contract(self) -> None:
+        window = NewEraDesktopTerminal(
+            api_url="http://127.0.0.1:59999",
+            ws_url="ws://127.0.0.1:59999/ws/logs",
+        )
+        try:
+            labels = [window.phase2_tabs.tabText(i) for i in range(window.phase2_tabs.count())]
+            self.assertEqual(
+                labels,
+                [
+                    "Live Execution & Interactive Chart",
+                    "Quant Gate & Confluence Control",
+                    "Bot & Strategy Fleet Manager",
+                    "Live Decision Audit & Analytics",
+                ],
+            )
+            self.assertIs(window.main_workspace_tabs, window.phase2_tabs)
+            self.assertEqual(window.phase2_live_tab.symbol_combo.currentText(), "XAUUSD")
+            for symbol in ("XAUUSD", "USTEC", "US500"):
+                self.assertNotEqual(window.phase2_live_tab.symbol_combo.findText(symbol), -1)
+
+            controls = window.phase2_controls_tab
+            self.assertTrue(controls.gemini_cio_toggle.isChecked())
+            self.assertTrue(controls.kronos_toggle.isChecked())
+            self.assertTrue(controls.l2_toggle.isChecked())
+            self.assertEqual(controls.confluence_combo.currentText(), "2-of-3")
+            self.assertEqual((controls.risk_pct_spin.minimum(), controls.risk_pct_spin.maximum()), (0.5, 5.0))
+            self.assertEqual((controls.min_rr_spin.minimum(), controls.min_rr_spin.maximum()), (1.0, 4.0))
+            self.assertEqual((controls.max_sl_atr_spin.minimum(), controls.max_sl_atr_spin.maximum()), (0.5, 5.0))
+            self.assertEqual((controls.time_stop_spin.minimum(), controls.time_stop_spin.maximum()), (30, 240))
+            self.assertEqual(controls.values()["max_sl_atr"], 2.5)
+        finally:
+            window.close()
+
+    def test_phase2_decision_audit_renders_ws_record_and_reason(self) -> None:
+        window = NewEraDesktopTerminal(
+            api_url="http://127.0.0.1:59999",
+            ws_url="ws://127.0.0.1:59999/ws/logs",
+        )
+        try:
+            record = {
+                "record_id": "audit-1",
+                "timestamp": "2026-10-21T12:34:56+00:00",
+                "symbol": "XAUUSD",
+                "signal": "BUY",
+                "action": "BUY",
+                "final_decision": "ABSTAIN",
+                "execution_mode": "BLOCKED",
+                "reason": "Opposing L2 sell wall blocked the candidate.",
+                "block_reason": "l2_veto",
+                "waterfall_layer_statuses": {
+                    "step1_talib": "PASS",
+                    "step2_kronos_matrix": "PASS",
+                    "step3_l2_safety": "BLOCKED",
+                    "step4_gemini_cio": "BLOCKED",
+                },
+                "waterfall_layer_reasons": {
+                    "step3_l2_safety": "sell wall veto",
+                },
+            }
+            window._on_ws_event_received(
+                {
+                    "type": "trade.decision",
+                    "timestamp": 1792586096.0,
+                    "payload": {"record": record},
+                }
+            )
+            audit = window.phase2_audit_tab
+            self.assertEqual(audit.decision_table.rowCount(), 1)
+            self.assertEqual(audit.decision_table.item(0, 1).text(), "XAUUSD")
+            self.assertEqual(audit.decision_table.item(0, 4).text(), "BLOCKED")
+            self.assertIn("Opposing L2 sell wall", audit.decision_table.item(0, 5).text())
+            self.assertIn("sell wall veto", audit.detail_view.toPlainText())
+            self.assertIn("BLOCKED", audit.detail_view.toPlainText())
+        finally:
+            window.close()
+
+    def test_phase3_native_menus_docks_and_status_bar_contract(self) -> None:
+        window = NewEraDesktopTerminal(
+            api_url="http://127.0.0.1:59999",
+            ws_url="ws://127.0.0.1:59999/ws/logs",
+        )
+        try:
+            self.assertEqual(
+                [action.text() for action in window.menuBar().actions()],
+                ["File", "View", "Insert", "Strategy Tools", "Bot Lab", "Help"],
+            )
+            self.assertIn("Export Audit Telemetry JSON", [action.text() for action in window.file_menu.actions()])
+            self.assertIn("Export Audit Telemetry CSV", [action.text() for action in window.file_menu.actions()])
+            self.assertIn("Save Workspace Layout", [action.text() for action in window.file_menu.actions()])
+            self.assertIn("Exit", [action.text() for action in window.file_menu.actions()])
+            self.assertIn("Indicators", [action.text() for action in window.insert_menu.actions()])
+            self.assertIn("Overlays", [action.text() for action in window.insert_menu.actions()])
+            self.assertIn("Custom Signal Widgets", [action.text() for action in window.insert_menu.actions()])
+            self.assertIn("Strategy Backtester", [action.text() for action in window.strategy_tools_menu.actions()])
+            self.assertIn("Manual Risk Override", [action.text() for action in window.strategy_tools_menu.actions()])
+            self.assertIn(
+                "GitHub Quant Module Search",
+                [action.text() for action in window.strategy_tools_menu.actions()],
+            )
+
+            expected_docks = {
+                "Live Chart / Execution": window.live_chart_dock,
+                "Decision Audit": window.decision_audit_dock,
+                "Quant Controls": window.quant_controls_dock,
+                "L2 Orderbook": window.l2_orderbook_dock,
+                "Bot Fleet": window.bot_fleet_dock,
+                "Bot Strategy Lab / Backtester": window.strategy_lab_dock,
+            }
+            self.assertEqual(
+                {dock.windowTitle() for dock in window.findChildren(QDockWidget)},
+                set(expected_docks),
+            )
+            for dock in expected_docks.values():
+                features = dock.features()
+                self.assertTrue(features & QDockWidget.DockWidgetFeature.DockWidgetClosable)
+                self.assertTrue(features & QDockWidget.DockWidgetFeature.DockWidgetMovable)
+                self.assertTrue(features & QDockWidget.DockWidgetFeature.DockWidgetFloatable)
+
+            self.assertIn("API:", window.status_api_label.text())
+            self.assertIn("WS PING:", window.status_ws_ping_label.text())
+            self.assertIn("ACTIVE BOTS:", window.status_active_bot_label.text())
+            self.assertIn("MT5 HEALTH:", window.status_mt5_health_label.text())
+
+            window.strategy_backtester_action.trigger()
+            self.assertIs(window.strategy_lab_panel.lab_tabs.currentWidget(), window.strategy_lab_panel.backtester_tab)
+            window.manual_risk_override_action.trigger()
+            self.assertIs(window.strategy_lab_panel.lab_tabs.currentWidget(), window.strategy_lab_panel.strategy_tab)
+            window.github_quant_module_search_action.trigger()
+            self.assertIn("metadata-only", window.strategy_lab_panel.signal_widget_placeholder.text())
+            window.insert_actions["Indicator: RSI"].trigger()
+            self.assertIn("Indicator: RSI", window.strategy_lab_panel.signal_widget_placeholder.text())
+
+            window._on_ws_status_changed(True, "WS LIVE STREAM")
+            window._on_ws_event_received(
+                {
+                    "type": "process.log",
+                    "timestamp": time.time(),
+                    "payload": {"message": "phase3 heartbeat"},
+                }
+            )
+            self.assertRegex(window.status_ws_ping_label.text(), r"WS PING: \d+ ms")
+            window._update_bots_ui(
+                {
+                    "active_bot": "phase3-bot",
+                    "bots": [
+                        {"id": "phase3-bot", "display_name": "Phase 3 Bot", "status": "enabled"},
+                        {"id": "paused-bot", "display_name": "Paused", "status": "disabled"},
+                    ],
+                }
+            )
+            self.assertEqual(window.status_active_bot_label.text(), "ACTIVE BOTS: 1")
+            window._update_mt5_status_ui(
+                {
+                    "connected": True,
+                    "account": {
+                        "login": 53012933,
+                        "company": "Raw Trading Ltd",
+                        "server": "ICMarketsSC-Demo",
+                        "balance": 1000.0,
+                        "equity": 1000.0,
+                        "margin_free": 1000.0,
+                        "leverage": 500,
+                        "trade_mode": "DEMO",
+                        "currency": "USD",
+                    },
+                }
+            )
+            self.assertIn("MT5 HEALTH: OK", window.status_mt5_health_label.text())
+        finally:
+            window.close()
+
+    def test_phase3_audit_exports_and_qsettings_layout(self) -> None:
+        window = NewEraDesktopTerminal(
+            api_url="http://127.0.0.1:59999",
+            ws_url="ws://127.0.0.1:59999/ws/logs",
+        )
+        try:
+            window.phase2_audit_tab.append_record(
+                {
+                    "record_id": "phase3-export-1",
+                    "timestamp": "2026-10-23T12:00:00+00:00",
+                    "symbol": "XAUUSD",
+                    "signal": "BUY",
+                    "final_decision": "ABSTAIN",
+                    "execution_mode": "BLOCKED",
+                    "reason": "safe export fixture",
+                }
+            )
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                json_path = window.export_audit_telemetry_json(temp_path / "telemetry.json")
+                csv_path = window.export_audit_telemetry_csv(temp_path / "telemetry.csv")
+                self.assertEqual(json_path, temp_path / "telemetry.json")
+                self.assertEqual(csv_path, temp_path / "telemetry.csv")
+                self.assertEqual(json.loads((temp_path / "telemetry.json").read_text(encoding="utf-8"))["records"][0]["record_id"], "phase3-export-1")
+                self.assertIn("phase3-export-1", (temp_path / "telemetry.csv").read_text(encoding="utf-8"))
+
+            window.save_workspace_layout()
+            self.assertIsNotNone(window._workspace_settings.value("ui/state"))
+            self.assertIsNotNone(window._workspace_settings.value("ui/geometry"))
+        finally:
+            window.close()
+
+    def test_phase3_strategy_lab_builds_visual_and_code_backend_payloads(self) -> None:
+        panel = BotStrategyLabPanel()
+        try:
+            visual_payload = panel.strategy_profile_payload()
+            self.assertEqual(visual_payload["builder"], "visual")
+            self.assertEqual(visual_payload["symbol"], "XAUUSD")
+            self.assertIn("indicators", visual_payload["flow"])
+            self.assertIn("actions", visual_payload["flow"])
+
+            panel.builder_mode_combo.setCurrentText("Python Code")
+            panel.module_path_input.setText("strategies/gold_trend.py")
+            panel.class_name_input.setText("GoldTrendFollower")
+            code_payload = panel.strategy_profile_payload()
+            self.assertEqual(code_payload["builder"], "code")
+            self.assertEqual(code_payload["module_path"], "strategies/gold_trend.py")
+            self.assertEqual(code_payload["class_name"], "GoldTrendFollower")
+
+            captured: list[dict[str, object]] = []
+            panel.strategy_backtest_requested.connect(captured.append)
+            panel.saved_strategy_combo.setCurrentIndex(0)
+            panel.run_backtest()
+            self.assertEqual(len(captured), 1)
+            self.assertEqual(captured[0]["symbol"], "XAUUSD")
+            self.assertIn("profile", captured[0])
+        finally:
+            panel.close()
 
 
 if __name__ == "__main__":
