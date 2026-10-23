@@ -9,6 +9,7 @@ workers and connects their results to these widgets.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable, Mapping
 from typing import Any, cast
 
@@ -77,6 +78,19 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _safe_ai_text(value: Any, default: str = "", limit: int = 320) -> str:
+    """Keep AI-facing UI text concise and free of hidden reasoning blocks."""
+
+    text = _safe_text(value, default)
+    text = re.sub(r"<(?:think|analysis)>.*?</(?:think|analysis)>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<(?:think|analysis)>.*$", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"</(?:think|analysis)>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        return text[:limit].rstrip() + "…"
+    return text or default
 
 
 def normalize_control_state(state: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -848,11 +862,17 @@ class BotStrategyLabPanel(QWidget):
     strategy_backtest_requested = pyqtSignal(dict)
     strategy_walk_forward_requested = pyqtSignal(dict)
     strategy_load_requested = pyqtSignal(dict)
+    ai_status_requested = pyqtSignal()
+    ai_analysis_requested = pyqtSignal(str)
+    ai_proposals_requested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("Phase3BotStrategyLabPanel")
         self._last_tool = ""
+        self._ai_symbol = "XAUUSD"
+        self._ai_last_result: dict[str, Any] = {}
+        self._ai_proposals: list[dict[str, Any]] = []
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -928,6 +948,134 @@ class BotStrategyLabPanel(QWidget):
         config_grid.addWidget(self.class_name_input, 3, 3)
 
         strategy_layout.addWidget(config_card)
+
+        ai_card = QFrame(strategy_tab)
+        ai_card.setObjectName("SubCard")
+        self.ai_engine_card = ai_card
+        self.ai_bot_factory_card = ai_card
+        ai_layout = QVBoxLayout(ai_card)
+        ai_layout.setContentsMargins(10, 8, 10, 8)
+        ai_layout.setSpacing(6)
+
+        ai_header = QHBoxLayout()
+        ai_title = QLabel("LOCAL AI ENGINE / BOT FACTORY")
+        ai_title.setObjectName("MetricTitle")
+        self.ai_model_label = QLabel("MODEL: DeepSeek / Ollama")
+        self.ai_model_label.setObjectName("MetricValue")
+        self.ai_status_badge = QLabel("OFFLINE")
+        self.ai_status_badge.setObjectName("Phase3AiStatusBadge")
+        self._style_ai_status_badge("warning")
+        ai_header.addWidget(ai_title)
+        ai_header.addStretch(1)
+        ai_header.addWidget(self.ai_model_label)
+        ai_header.addWidget(self.ai_status_badge)
+        ai_layout.addLayout(ai_header)
+
+        ai_controls = QHBoxLayout()
+        ai_controls.setSpacing(6)
+        self.ai_symbol_label = QLabel("ANALYSIS SYMBOL: XAUUSD")
+        self.ai_symbol_label.setObjectName("MetricTitle")
+        self.refresh_ai_status_button = QPushButton("↻ Refresh AI Status", ai_card)
+        self.refresh_ai_status_button.setObjectName("ChipButton")
+        self.refresh_ai_status_button.clicked.connect(self._emit_ai_status_requested)
+        self.run_local_ai_analysis_button = QPushButton("▶ Run Local AI Analysis", ai_card)
+        self.run_local_ai_analysis_button.setObjectName("PrimaryScanButton")
+        self.run_local_ai_analysis_button.setToolTip(
+            "Run the local DeepSeek/Ollama advisor for the active symbol. Research-only; no orders are created."
+        )
+        self.run_local_ai_analysis_button.clicked.connect(self._emit_ai_analysis_requested)
+        self.refresh_ai_proposals_button = QPushButton("↻ Refresh AI Proposals", ai_card)
+        self.refresh_ai_proposals_button.setObjectName("ChipButton")
+        self.refresh_ai_proposals_button.clicked.connect(self._emit_ai_proposals_requested)
+        ai_controls.addWidget(self.ai_symbol_label)
+        ai_controls.addStretch(1)
+        ai_controls.addWidget(self.refresh_ai_status_button)
+        ai_controls.addWidget(self.run_local_ai_analysis_button)
+        ai_controls.addWidget(self.refresh_ai_proposals_button)
+        ai_layout.addLayout(ai_controls)
+
+        # Reader-friendly aliases keep the Phase 3 AI surface discoverable to
+        # integrations without changing the existing Strategy Lab contract.
+        self.ai_status_button = self.refresh_ai_status_button
+        self.ai_analyze_button = self.run_local_ai_analysis_button
+        self.ai_proposals_button = self.refresh_ai_proposals_button
+        self.ai_engine_status_badge = self.ai_status_badge
+        self.ai_engine_model_label = self.ai_model_label
+        self.ai_status_label = self.ai_status_badge
+
+        ai_metrics = QGridLayout()
+        ai_metrics.setHorizontalSpacing(12)
+        ai_metrics.setVerticalSpacing(4)
+        for column, (title_text, value_text) in enumerate(
+            (
+                ("LAST DECISION", "ABSTAIN"),
+                ("CONFIDENCE", "0.0%"),
+                ("RISK", "0.0%"),
+                ("R:R", "≥ 1.5 R"),
+                ("SL", "≤ 2.5x ATR"),
+                ("TIME STOP", "120 min"),
+            )
+        ):
+            metric = QVBoxLayout()
+            metric_title = QLabel(title_text, ai_card)
+            metric_title.setObjectName("MetricTitle")
+            metric_value = QLabel(value_text, ai_card)
+            metric_value.setObjectName("MetricValue")
+            metric.addWidget(metric_title)
+            metric.addWidget(metric_value)
+            ai_metrics.addLayout(metric, 0, column)
+            if title_text == "LAST DECISION":
+                self.ai_decision_label = metric_value
+            elif title_text == "CONFIDENCE":
+                self.ai_confidence_label = metric_value
+            elif title_text == "RISK":
+                self.ai_risk_label = metric_value
+            elif title_text == "R:R":
+                self.ai_rr_label = metric_value
+            elif title_text == "SL":
+                self.ai_sl_label = metric_value
+            else:
+                self.ai_time_stop_label = metric_value
+        self.ai_last_decision_label = self.ai_decision_label
+        self.ai_confidence_value = self.ai_confidence_label
+        self.ai_risk_value = self.ai_risk_label
+        self.ai_rr_value = self.ai_rr_label
+        self.ai_sl_value = self.ai_sl_label
+        self.ai_time_stop_value = self.ai_time_stop_label
+        ai_layout.addLayout(ai_metrics)
+
+        rationale_header = QHBoxLayout()
+        rationale_header.addWidget(QLabel("CONCISE RATIONALE", ai_card))
+        self.ai_proposal_count_label = QLabel("PROPOSALS: 0", ai_card)
+        self.ai_proposal_count_label.setObjectName("MetricValue")
+        self.ai_proposal_count = self.ai_proposal_count_label
+        rationale_header.addStretch(1)
+        rationale_header.addWidget(self.ai_proposal_count_label)
+        ai_layout.addLayout(rationale_header)
+
+        self.ai_rationale_view = QTextEdit(ai_card)
+        self.ai_rationale_view.setObjectName("LocalAiRationaleView")
+        self.ai_rationale_view.setReadOnly(True)
+        self.ai_rationale_view.setMaximumHeight(58)
+        self.ai_rationale_view.setPlainText("No local AI analysis received.")
+        ai_layout.addWidget(self.ai_rationale_view)
+
+        self.ai_proposals_view = QTextEdit(ai_card)
+        self.ai_proposals_view.setObjectName("LocalAiProposalsView")
+        self.ai_proposals_view.setReadOnly(True)
+        self.ai_proposals_view.setMaximumHeight(62)
+        self.ai_proposals_view.setPlaceholderText("Research-only bot proposals will appear here.")
+        ai_layout.addWidget(self.ai_proposals_view)
+
+        self.ai_guard_label = QLabel(
+            "RESEARCH-ONLY / ORDER EXECUTION DISABLED — local AI cannot place trades or enable bots."
+        )
+        self.ai_guard_label.setObjectName("Phase3AiGuardLabel")
+        ai_layout.addWidget(self.ai_guard_label)
+        self.ai_transport_status_label = QLabel("AI transport: waiting for /ai/status")
+        self.ai_transport_status_label.setObjectName("Phase3StrategyStatus")
+        ai_layout.addWidget(self.ai_transport_status_label)
+        strategy_layout.addWidget(ai_card)
 
         flow_card = QFrame(strategy_tab)
         flow_card.setObjectName("SubCard")
@@ -1094,6 +1242,194 @@ class BotStrategyLabPanel(QWidget):
     @property
     def last_tool(self) -> str:
         return self._last_tool
+
+    @property
+    def ai_symbol(self) -> str:
+        return self._ai_symbol
+
+    def set_active_symbol(self, symbol: str) -> None:
+        normalized = _safe_text(symbol, "XAUUSD").upper()
+        self._ai_symbol = normalized or "XAUUSD"
+        self.ai_symbol_label.setText(f"ANALYSIS SYMBOL: {self._ai_symbol}")
+
+    def set_ai_transport_status(self, text: str, *, error: bool = False) -> None:
+        self.ai_transport_status_label.setText(text)
+        self.ai_transport_status_label.setStyleSheet(
+            f"color: {'#ef4444' if error else '#94a3b8'};"
+        )
+
+    def _style_ai_status_badge(self, state: str) -> None:
+        colors = {
+            "online": ("#064e3b", "#34d399", "#10b981"),
+            "offline": ("#450a0a", "#fca5a5", "#ef4444"),
+            "warning": ("#451a03", "#fbbf24", "#f59e0b"),
+            "disabled": ("#1e293b", "#94a3b8", "#475569"),
+        }
+        background, foreground, border = colors.get(state, colors["warning"])
+        self.ai_status_badge.setStyleSheet(
+            f"background-color: {background}; color: {foreground}; border: 1px solid {border}; "
+            "border-radius: 3px; padding: 2px 6px; font-family: 'Consolas', monospace; font-weight: bold;"
+        )
+
+    def _style_ai_decision(self, action: str) -> None:
+        color = {"BUY": "#10b981", "SELL": "#ef4444"}.get(action, "#f59e0b")
+        self.ai_decision_label.setStyleSheet(
+            f"color: {color}; font-family: 'Consolas', monospace; font-size: 13px; font-weight: bold;"
+        )
+
+    def _emit_ai_status_requested(self) -> None:
+        self.set_ai_transport_status("Refreshing local AI status…")
+        self.ai_status_requested.emit()
+
+    def _emit_ai_analysis_requested(self) -> None:
+        self.set_ai_transport_status(f"Queueing local AI analysis for {self._ai_symbol}…")
+        self.ai_analysis_requested.emit(self._ai_symbol)
+
+    def _emit_ai_proposals_requested(self) -> None:
+        self.set_ai_transport_status("Refreshing research-only AI proposals…")
+        self.ai_proposals_requested.emit()
+
+    def set_ai_status(self, data: Mapping[str, Any] | None) -> None:
+        payload = data if isinstance(data, Mapping) else {}
+        model = _safe_text(payload.get("model"), "DeepSeek / Ollama")
+        self.ai_model_label.setText(f"MODEL: {model}")
+        enabled = bool(payload.get("enabled", True))
+        offline = bool(payload.get("offline", False))
+        factory_value = payload.get("ai_bot_factory")
+        factory: Mapping[str, Any] = factory_value if isinstance(factory_value, Mapping) else {}
+        factory_status = _safe_text(factory.get("status"), "offline" if offline else "ready").lower()
+        if not enabled or factory_status == "disabled":
+            status_text, status_style = "DISABLED", "disabled"
+            self.ai_guard_label.setText(
+                "AI DISABLED / RESEARCH-ONLY — no local analysis or bot activation is permitted."
+            )
+        elif offline or factory_status in {"offline", "blocked"}:
+            status_text, status_style = "OFFLINE", "warning"
+            self.ai_guard_label.setText(
+                "RESEARCH-ONLY / ORDER EXECUTION DISABLED — local AI is offline; fail-closed mode is active."
+            )
+        else:
+            status_text, status_style = "ONLINE", "online"
+            self.ai_guard_label.setText(
+                "RESEARCH-ONLY / ORDER EXECUTION DISABLED — local AI may advise, never place trades."
+            )
+        self.ai_status_badge.setText(status_text)
+        self._style_ai_status_badge(status_style)
+        counts_value = payload.get("counts")
+        counts: Mapping[str, Any] = counts_value if isinstance(counts_value, Mapping) else {}
+        factory_counts = factory.get("counts")
+        if not counts and isinstance(factory_counts, Mapping):
+            counts = factory_counts
+        count = counts.get("strategy_profiles", counts.get("proposals_persisted", 0))
+        try:
+            count_text = str(max(0, int(count)))
+        except (TypeError, ValueError):
+            count_text = "0"
+        self.ai_proposal_count_label.setText(f"PROPOSALS: {count_text}")
+        self.set_ai_transport_status(f"GET /ai/status → {status_text}")
+
+    def set_ai_result(self, data: Mapping[str, Any] | None) -> None:
+        payload = dict(data) if isinstance(data, Mapping) else {}
+        decision_value = payload.get("decision")
+        decision = dict(decision_value) if isinstance(decision_value, Mapping) else payload
+        self._ai_last_result = dict(payload)
+
+        action = _safe_text(payload.get("action") or decision.get("action"), "ABSTAIN").upper()
+        if action not in {"BUY", "SELL", "ABSTAIN"}:
+            action = "ABSTAIN"
+        confidence_raw = payload.get("confidence", decision.get("confidence", 0.0))
+        confidence = _safe_float(confidence_raw)
+        confidence_pct = confidence * 100.0 if abs(confidence) <= 1.0 else confidence
+        risk_pct = _safe_float(payload.get("risk_pct", decision.get("risk_pct", 0.0)))
+        min_rr = _safe_float(
+            payload.get("min_rr", decision.get("min_rr", decision.get("risk_reward", 1.5))),
+            1.5,
+        )
+        max_sl_atr = _safe_float(
+            payload.get("max_sl_atr", decision.get("max_sl_atr", decision.get("sl_atr", 2.5))),
+            2.5,
+        )
+        try:
+            time_stop = int(payload.get("time_stop_minutes", decision.get("time_stop_minutes", 120)))
+        except (TypeError, ValueError):
+            time_stop = 120
+        rationale = _safe_ai_text(
+            payload.get("rationale")
+            or decision.get("reasoning_summary")
+            or decision.get("reasoning"),
+            "No public rationale supplied.",
+        )
+        status = _safe_text(payload.get("status") or decision.get("status"), "RESEARCH_ONLY").upper()
+        availability = _safe_text(payload.get("availability"), "ready").lower()
+
+        self.ai_decision_label.setText(action)
+        self._style_ai_decision(action)
+        self.ai_confidence_label.setText(f"{confidence_pct:.1f}%")
+        self.ai_risk_label.setText(f"{risk_pct:.2f}%")
+        self.ai_rr_label.setText(f"≥ {min_rr:.2f} R")
+        self.ai_sl_label.setText(f"≤ {max_sl_atr:.2f}x ATR")
+        self.ai_time_stop_label.setText(f"{time_stop} min")
+        self.ai_rationale_view.setPlainText(rationale)
+
+        persistence = payload.get("proposal_persistence")
+        persistence_map = persistence if isinstance(persistence, Mapping) else {}
+        proposal_value = decision.get("bot_proposals")
+        if not isinstance(proposal_value, list):
+            proposal_value = payload.get("bot_proposals") if isinstance(payload.get("bot_proposals"), list) else []
+        proposals: list[Any] = list(proposal_value) if isinstance(proposal_value, list) else []
+        proposal_count = payload.get("proposal_count")
+        if proposal_count is None:
+            proposal_count = persistence_map.get("validated", len(proposals))
+        try:
+            proposal_count_int = max(0, int(proposal_count))
+        except (TypeError, ValueError):
+            proposal_count_int = len(proposals)
+        self.ai_proposal_count_label.setText(f"PROPOSALS: {proposal_count_int}")
+
+        if status == "DISABLED" or availability == "disabled":
+            self.ai_status_badge.setText("DISABLED")
+            self._style_ai_status_badge("disabled")
+        elif status == "BLOCKED" or availability in {"offline", "blocked"}:
+            self.ai_status_badge.setText("OFFLINE" if availability == "offline" else "BLOCKED")
+            self._style_ai_status_badge("warning")
+        else:
+            self.ai_status_badge.setText("ONLINE")
+            self._style_ai_status_badge("online")
+        self.set_ai_transport_status(f"AI decision received for {self._ai_symbol} ({status}).")
+
+    set_ai_decision_event = set_ai_result
+
+    def set_ai_proposals(self, data: Mapping[str, Any] | None) -> None:
+        payload = data if isinstance(data, Mapping) else {}
+        raw_proposals = payload.get("proposals")
+        proposals = [dict(item) for item in raw_proposals if isinstance(item, Mapping)] if isinstance(raw_proposals, list) else []
+        self._ai_proposals = proposals
+        count_value = payload.get("count", len(proposals))
+        try:
+            count = max(0, int(count_value))
+        except (TypeError, ValueError):
+            count = len(proposals)
+        self.ai_proposal_count_label.setText(f"PROPOSALS: {count}")
+        if proposals:
+            lines = []
+            for proposal in proposals[:8]:
+                proposal_id = _safe_text(proposal.get("id"), "proposal")
+                name = _safe_text(proposal.get("name") or proposal.get("display_name"), proposal_id)
+                symbol = _safe_text(proposal.get("symbol"), self._ai_symbol).upper()
+                lines.append(f"• {proposal_id} — {name} [{symbol}]  [RESEARCH-ONLY / DISABLED]")
+            self.ai_proposals_view.setPlainText("\n".join(lines))
+        else:
+            self.ai_proposals_view.setPlainText("No research-only AI proposals are currently registered.")
+        self.set_ai_transport_status(f"GET /ai/proposals → {count} research-only proposal(s).")
+
+    def set_ai_error(self, task_name: str, message: str) -> None:
+        self.ai_status_badge.setText("OFFLINE")
+        self._style_ai_status_badge("warning")
+        self.set_ai_transport_status(f"{task_name}: {_safe_ai_text(message, 'request failed', 220)}", error=True)
+
+    update_ai_status = set_ai_status
+    update_ai_result = set_ai_result
+    update_ai_proposals = set_ai_proposals
 
     def _builder_type(self) -> str:
         return "code" if self.builder_mode_combo.currentText().strip().lower().startswith("python") else "visual"

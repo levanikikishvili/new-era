@@ -100,6 +100,32 @@ class GeminiAnalyzeRequest(BaseModel):
     account_equity: float = Field(default=1000.0, gt=0.0)
 
 
+class AIAnalyzeRequest(BaseModel):
+    """Read-only local Ollama analysis request.
+
+    The optional context fields are research inputs only. The backend bounds
+    and sanitizes them again before they reach the model transport.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str = Field(default="XAUUSD", min_length=1, max_length=32)
+    context: dict[str, Any] = Field(default_factory=dict)
+    ohlcv: list[dict[str, Any]] | None = None
+    indicators: dict[str, Any] | None = None
+    kronos_matrix: dict[str, Any] | None = None
+    l2_dom: dict[str, Any] | None = None
+
+    @field_validator("symbol")
+    @classmethod
+    def safe_symbol(cls, value: str) -> str:
+        value = value.strip().upper()
+        allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+-")
+        if not value or any(character not in allowed for character in value):
+            raise ValueError("symbol contains unsupported characters")
+        return value
+
+
 class AutonomousModeRequest(BaseModel):
     autonomous_mode: bool = False
     dynamic_trailing_enabled: bool = True

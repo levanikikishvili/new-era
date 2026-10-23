@@ -90,6 +90,27 @@ class ApiSettings:
         1,
         int(os.getenv("NEWERA_DECISION_HISTORY_MAX_RECORDS", "1000")),
     )
+    # The local AI adapter is enabled as a pipeline stage, but remains offline
+    # by default so a normal API/test process never makes an unexpected
+    # network request. Set NEWERA_AI_OFFLINE=false after Ollama is ready.
+    ai_enabled: bool = _bool("NEWERA_AI_ENABLED", True)
+    ai_offline: bool = _bool("NEWERA_AI_OFFLINE", True)
+    ai_endpoint: str = os.getenv(
+        "NEWERA_AI_ENDPOINT",
+        os.getenv("NEWERA_OLLAMA_ENDPOINT", "http://localhost:11434/v1/chat/completions"),
+    )
+    ai_model: str = os.getenv(
+        "NEWERA_AI_MODEL",
+        os.getenv("NEWERA_OLLAMA_MODEL", "deepseek-r1:8b"),
+    )
+    ai_timeout_seconds: float = max(
+        0.1,
+        min(float(os.getenv("NEWERA_AI_TIMEOUT_SECONDS", "30")), 300.0),
+    )
+    ai_context_max_bars: int = max(4, min(int(os.getenv("NEWERA_AI_CONTEXT_MAX_BARS", "32")), 128))
+    # StrategyLab persistence is always research-only. Registry mutation is a
+    # separate explicit opt-in and is disabled unless requested by config.
+    ai_bot_factory_registry_enabled: bool = _bool("NEWERA_AI_BOT_FACTORY_REGISTRY_ENABLED", False)
 
     @property
     def gemini_key_configured(self) -> bool:

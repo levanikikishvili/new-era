@@ -110,6 +110,46 @@ Strategy Lab endpoints:
 Python strategy modules and OHLCV data must resolve inside the workspace; paths
 outside the workspace are rejected before loading or backtesting.
 
+### Local DeepSeek/Ollama AI and read-only MCP
+
+Phase 3 also includes an optional local AI research stage:
+
+- Ollama OpenAI-compatible endpoint: `http://localhost:11434/v1/chat/completions`;
+- default model: `deepseek-r1:8b`;
+- AI is **offline/fail-closed by default** and must be explicitly enabled after
+  Ollama is installed and the model is available;
+- model output is strict-JSON validated and hard-capped at risk `<= 1.5%`,
+  R:R `>= 1.5`, SL `<= 2.5 ATR`, and time-stop `<= 120` minutes;
+- malformed or unsafe output becomes `ABSTAIN` / `BLOCKED`;
+- DeepSeek proposals may be persisted as research-only Strategy Lab profiles;
+  automatic bot-registry creation is opt-in and created profiles remain
+  disabled/non-executable;
+- hidden chain-of-thought is never persisted or displayed; only concise
+  reasoning summaries and structured evidence are retained.
+
+AI endpoints:
+
+- `GET /ai/status`
+- `GET /ai/proposals`
+- `POST /ai/analyze`
+- `POST /mcp` — local JSON-RPC read-only MCP facade.
+
+The MCP facade exposes bounded read-only market snapshot, L2/orderflow, audit,
+strategy-proposal validation/listing, and parallel-analysis tools. Order
+placement, shell execution, arbitrary Python execution, and live-trading tools
+are rejected by design.
+
+Optional local configuration:
+
+```text
+NEWERA_AI_ENABLED=true
+NEWERA_AI_OFFLINE=false
+NEWERA_AI_ENDPOINT=http://localhost:11434/v1/chat/completions
+NEWERA_AI_MODEL=deepseek-r1:8b
+NEWERA_AI_TIMEOUT_SECONDS=30
+NEWERA_AI_BOT_FACTORY_REGISTRY_ENABLED=false
+```
+
 ## Runtime and dependencies
 
 - Python **3.13.5**, pinned in `.python-version`.

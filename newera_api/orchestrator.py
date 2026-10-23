@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import inspect
 import json
 import math
 import os
@@ -25,15 +26,26 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from kronos_matrix_strategy import STRATEGY_ID, write_gate_csv
 
+from .ai_engine import (
+    DEFAULT_OLLAMA_MODEL,
+    OllamaAIEngine,
+    SafeDecision,
+    build_scan_context,
+    json_safe_copy,
+    normalize_model_result,
+    normalize_research_strategy_profile,
+)
+from .bot_lab import StrategyLab
 from .config import ApiSettings, load_workspace_dotenv
 from .controls import RuntimeControls
 from .events import EventBus, event
 from .gemini_manager import GeminiPortfolioManager, Step1TALibResult, TALibTechnicalEngine
 from .memory import MemoryStore
+from .mcp_server import MCPServer
 from .mt5_bridge import (
     close_mt5_demo_positions,
     execute_mt5_demo_order,
@@ -199,6 +211,51 @@ class Orchestrator:
             self.bus,
             max_records=max(1, int(getattr(self.settings, "decision_history_max_records", 1000))),
         )
+        # The local model is an untrusted, research-only advisor. It is kept
+        # separate from every existing execution gate and is never consulted by
+        # the order path to authorize a trade.
+        self.ai_engine = OllamaAIEngine(
+            endpoint=getattr(self.settings, "ai_endpoint", None),
+            model=getattr(self.settings, "ai_model", DEFAULT_OLLAMA_MODEL),
+            timeout=getattr(self.settings, "ai_timeout_seconds", 30.0),
+            offline=getattr(self.settings, "ai_offline", True),
+        )
+        self.strategy_lab = StrategyLab(self.settings)
+        self._ai_proposal_profiles: dict[str, dict[str, Any]] = {}
+        self._ai_proposal_records: list[dict[str, Any]] = []
+        self._ai_metrics: dict[str, Any] = {
+            "analyses_total": 0,
+            "analyses_completed": 0,
+            "analyses_blocked": 0,
+            "analyses_disabled": 0,
+            "proposals_seen": 0,
+            "proposals_persisted": 0,
+            "proposals_deduplicated": 0,
+            "proposals_failed": 0,
+            "registry_profiles_created": 0,
+            "registry_profiles_updated": 0,
+            "last_analysis_at": None,
+            "last_error": None,
+        }
+        try:
+            for profile in self.strategy_lab.list_profiles():
+                metadata = profile.get("metadata") if isinstance(profile, Mapping) else None
+                if not isinstance(metadata, Mapping) or metadata.get("source") != "ai_engine":
+                    continue
+                profile_id = str(profile.get("id") or "").strip().lower()
+                if profile_id:
+                    self._ai_proposal_profiles[profile_id] = self._ai_profile_view(profile)
+        except Exception:
+            # Existing malformed research files are omitted by StrategyLab;
+            # startup must remain available even if the profile directory is
+            # unreadable.
+            self._ai_proposal_profiles = {}
+        self.mcp_server = MCPServer(
+            market_snapshot_provider=self._mcp_market_snapshot,
+            decision_audit_provider=self._mcp_decision_audit,
+            strategy_proposals=self._ai_proposal_profiles.values(),
+            max_parallel=4,
+        )
         self.paused: bool = False
         self._latest_l2: dict[str, dict[str, Any]] = {}
         self.jobs: dict[str, ScanJob] = {}
@@ -227,6 +284,746 @@ class Orchestrator:
 
     def get_controls(self) -> dict[str, Any]:
         return self.controls.snapshot()
+
+    @staticmethod
+    def _blocked_ai_decision(reason: str, *, symbol: str = "") -> SafeDecision:
+        """Create a bounded, non-executable decision for every AI failure path."""
+
+        return SafeDecision(
+            action="ABSTAIN",
+            confidence=0.0,
+            risk_pct=0.0,
+            min_rr=1.5,
+            max_sl_atr=2.5,
+            time_stop_minutes=120,
+            reasoning_summary="AI analysis was blocked; no executable decision was produced.",
+            evidence=[{"type": "safety", "status": "BLOCKED", "reason": str(reason)[:240]}],
+            bot_proposals=[],
+            status="BLOCKED",
+            block_reason=str(reason)[:240],
+            symbol=str(symbol or "").strip().upper(),
+            research_only=True,
+            executable=False,
+            execution_allowed=False,
+        )
+
+    @staticmethod
+    def _bound_ai_value(value: Any, *, depth: int = 0) -> Any:
+        """Keep model context finite without exposing arbitrary objects."""
+
+        if depth > 5:
+            return None
+        if hasattr(value, "to_dict") and callable(getattr(value, "to_dict")):
+            try:
+                value = value.to_dict()
+            except Exception:
+                return None
+        if value is None or isinstance(value, (str, bool, int)):
+            return value[:1000] if isinstance(value, str) else value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+        if isinstance(value, Mapping):
+            bounded: dict[str, Any] = {}
+            for index, (key, item) in enumerate(value.items()):
+                if index >= 64:
+                    break
+                bounded[str(key)[:120]] = Orchestrator._bound_ai_value(item, depth=depth + 1)
+            return bounded
+        if isinstance(value, (list, tuple)):
+            return [Orchestrator._bound_ai_value(item, depth=depth + 1) for item in list(value)[:64]]
+        return str(value)[:256]
+
+    @staticmethod
+    def _redact_ai_value(value: Any, *, depth: int = 0) -> Any:
+        """Remove hidden-reasoning tags before telemetry or profile storage."""
+
+        if depth > 6:
+            return None
+        if isinstance(value, str):
+            text = re.sub(
+                r"<(?:think|analysis)>.*?</(?:think|analysis)>",
+                "",
+                value,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            text = re.sub(r"<(?:think|analysis)>.*$", "", text, flags=re.IGNORECASE | re.DOTALL)
+            text = re.sub(r"</(?:think|analysis)>", "", text, flags=re.IGNORECASE)
+            text = re.sub(r"\s+", " ", text).strip()
+            return text[:480] + ("…" if len(text) > 480 else "")
+        if isinstance(value, Mapping):
+            return {
+                str(key): Orchestrator._redact_ai_value(item, depth=depth + 1)
+                for key, item in list(value.items())[:128]
+            }
+        if isinstance(value, (list, tuple)):
+            return [Orchestrator._redact_ai_value(item, depth=depth + 1) for item in list(value)[:64]]
+        return value
+
+    @staticmethod
+    def _read_latest_ohlcv_csv(path: Path | None, max_bars: int = 32) -> list[dict[str, Any]]:
+        """Read only the latest finite OHLCV rows for the local AI prompt."""
+
+        if path is None or not path.is_file():
+            return []
+        rows: list[dict[str, Any]] = []
+        try:
+            with path.open("r", newline="", encoding="utf-8-sig", errors="replace") as handle:
+                reader = csv.DictReader(handle)
+                for raw in reader:
+                    normalized_raw = {str(key).strip().lower(): value for key, value in raw.items()}
+                    try:
+                        values: dict[str, Any] = {
+                            "open": float(normalized_raw.get("open") or 0.0),
+                            "high": float(normalized_raw.get("high") or 0.0),
+                            "low": float(normalized_raw.get("low") or 0.0),
+                            "close": float(normalized_raw.get("close") or 0.0),
+                            "volume": float(normalized_raw.get("volume") or 0.0),
+                        }
+                        if any(not math.isfinite(float(item)) for item in values.values()):
+                            continue
+                        if min(values["open"], values["high"], values["low"], values["close"]) <= 0:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                    timestamp = normalized_raw.get("timestamp") or normalized_raw.get("time") or normalized_raw.get("date")
+                    if timestamp not in (None, ""):
+                        values["timestamp"] = timestamp
+                    rows.append(values)
+        except OSError:
+            return []
+        return rows[-max(1, int(max_bars)) :]
+
+    @staticmethod
+    def _mapping_or_empty(value: Any) -> dict[str, Any]:
+        if isinstance(value, Mapping):
+            return dict(value)
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            try:
+                converted = to_dict()
+                return dict(converted) if isinstance(converted, Mapping) else {}
+            except Exception:
+                return {}
+        return {}
+
+    @staticmethod
+    def _waterfall_step2(waterfall: Any) -> dict[str, Any]:
+        waterfall_obj = Orchestrator._mapping_or_empty(waterfall)
+        steps = waterfall_obj.get("steps")
+        if isinstance(steps, Mapping):
+            return Orchestrator._mapping_or_empty(steps.get("step2_kronos_matrix"))
+        return Orchestrator._mapping_or_empty(waterfall_obj.get("step2_kronos_matrix"))
+
+    def _mcp_market_snapshot(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        symbol = str(arguments.get("symbol") or self.settings.default_symbol).strip().upper()
+        try:
+            return get_mt5_symbol_snapshot(symbol)
+        except Exception as exc:
+            latest = self._latest_l2.get(symbol)
+            if latest is not None:
+                return {"symbol": symbol, "source": "l2_memory", "snapshot": latest, "read_only": True}
+            return {
+                "symbol": symbol,
+                "available": False,
+                "source": "offline",
+                "error": str(exc)[:160],
+                "read_only": True,
+            }
+
+    def _mcp_decision_audit(self, arguments: dict[str, Any]) -> list[dict[str, Any]]:
+        try:
+            limit = max(1, min(int(arguments.get("limit", 100)), 5000))
+        except (TypeError, ValueError):
+            limit = 100
+        return self.decision_logger.read_records(limit)
+
+    def ai_status(self) -> dict[str, Any]:
+        enabled = bool(getattr(self.settings, "ai_enabled", True))
+        offline = bool(getattr(self.ai_engine, "offline", getattr(self.settings, "ai_offline", True)))
+        if not enabled:
+            factory_status = "disabled"
+        elif offline:
+            factory_status = "offline"
+        else:
+            factory_status = "ready"
+        counts = {
+            **self._ai_metrics,
+            "strategy_profiles": len(self._ai_proposal_profiles),
+            "proposal_records": len(self._ai_proposal_records),
+        }
+        return {
+            "enabled": enabled,
+            "offline": offline,
+            "model": str(getattr(self.ai_engine, "model", DEFAULT_OLLAMA_MODEL)),
+            "endpoint": str(getattr(self.ai_engine, "endpoint", "")),
+            "fail_closed": True,
+            "research_only": True,
+            "execution_allowed": False,
+            "real_account_allowed": False,
+            "order_execution_allowed": False,
+            "ai_bot_factory": {
+                "status": factory_status,
+                "analysis_enabled": enabled,
+                "registry_enabled": bool(getattr(self.settings, "ai_bot_factory_registry_enabled", False)),
+                "default_registry_enabled": False,
+                "research_only": True,
+                "enabled": False,
+                "real_account_allowed": False,
+                "order_execution_allowed": False,
+                "counts": counts,
+            },
+            "counts": counts,
+        }
+
+    def _refresh_ai_profiles_sync(self) -> list[dict[str, Any]]:
+        profiles = [
+            profile
+            for profile in self.strategy_lab.list_profiles()
+            if isinstance(profile.get("metadata"), Mapping)
+            and profile["metadata"].get("source") == "ai_engine"
+        ]
+        self._ai_proposal_profiles = {
+            str(profile.get("id") or "").strip().lower(): self._ai_profile_view(profile)
+            for profile in profiles
+            if str(profile.get("id") or "").strip()
+        }
+        if hasattr(self, "mcp_server"):
+            self.mcp_server._strategy_proposals = [  # type: ignore[attr-defined]
+                json_safe_copy(profile) for profile in self._ai_proposal_profiles.values()
+            ]
+        return list(self._ai_proposal_profiles.values())
+
+    async def get_ai_proposals(self) -> dict[str, Any]:
+        profiles = await asyncio.to_thread(self._refresh_ai_profiles_sync)
+        return {
+            "proposals": profiles,
+            "count": len(profiles),
+            "ai_bot_factory": self.ai_status()["ai_bot_factory"],
+            "research_only": True,
+            "enabled": False,
+            "real_account_allowed": False,
+            "order_execution_allowed": False,
+        }
+
+    @staticmethod
+    def _registry_profile(profile: Mapping[str, Any]) -> dict[str, Any]:
+        profile_id = str(profile.get("id") or "").strip().lower()
+        name = str(profile.get("name") or profile.get("display_name") or profile_id).strip()
+        symbol = str(profile.get("symbol") or "XAUUSD").strip().upper()
+        return {
+            "id": profile_id,
+            "display_name": name,
+            "status": "research_only",
+            "enabled": False,
+            "symbol": symbol,
+            "execution": {"kind": "research_profile", "source": None},
+            "research": {
+                "kind": "ai_bot_factory",
+                "profile": f"TradingAgentsData/strategies/{profile_id}.json",
+                "output_directory": "TradingAgentsData/research",
+            },
+            "safety": {
+                "research_only": True,
+                "real_account_allowed": False,
+                "order_execution_allowed": False,
+                "direct_python_orders": False,
+            },
+        }
+
+    @staticmethod
+    def _ai_profile_view(profile: Mapping[str, Any]) -> dict[str, Any]:
+        """Expose every AI proposal with an explicit disabled safety contract."""
+
+        safety = dict(profile.get("safety") or {})
+        safety.update(
+            {
+                "research_only": True,
+                "real_account_allowed": False,
+                "order_execution_allowed": False,
+                "direct_python_orders": False,
+            }
+        )
+        return {
+            **json_safe_copy(dict(profile)),
+            "status": "research_only",
+            "enabled": False,
+            "research_only": True,
+            "real_account_allowed": False,
+            "order_execution_allowed": False,
+            "safety": safety,
+        }
+
+    def _upsert_registry_profiles_sync(self, profiles: list[dict[str, Any]]) -> dict[str, Any]:
+        """Optionally expose research profiles in the safe bot registry."""
+
+        if not bool(getattr(self.settings, "ai_bot_factory_registry_enabled", False)) or not profiles:
+            return {"enabled": False, "created": 0, "updated": 0, "errors": []}
+
+        import bot_manager
+
+        registry_path = self.settings.registry_path
+        if registry_path.exists():
+            registry = bot_manager.load_json(registry_path)
+        else:
+            registry = {
+                "schema_version": 1,
+                "workspace_name": "New Era Trading Bot Lab",
+                "active_bot": None,
+                "shared_rules": {
+                    "real_account_allowed": False,
+                    "new_bots_start_in": "research_only",
+                },
+                "bots": [],
+            }
+        bots = registry.get("bots")
+        if not isinstance(bots, list):
+            raise ValueError("bot registry bots must be a list")
+        existing_errors = bot_manager.validate_registry(registry) if registry_path.exists() else []
+        if existing_errors:
+            raise ValueError("existing bot registry is invalid: " + "; ".join(existing_errors[:5]))
+
+        created = 0
+        updated = 0
+        for profile in profiles:
+            safe_profile = self._registry_profile(profile)
+            profile_id = safe_profile["id"]
+            profile_name = safe_profile["display_name"].casefold()
+            existing = next(
+                (
+                    item
+                    for item in bots
+                    if isinstance(item, dict)
+                    and (
+                        str(item.get("id") or "").strip().lower() == profile_id
+                        or str(item.get("display_name") or "").strip().casefold() == profile_name
+                    )
+                ),
+                None,
+            )
+            if existing is None:
+                bots.append(safe_profile)
+                created += 1
+            else:
+                existing_id = str(existing.get("id") or "")
+                existing.clear()
+                existing.update(safe_profile)
+                if str(registry.get("active_bot") or "") == existing_id:
+                    registry["active_bot"] = safe_profile["id"]
+                updated += 1
+        if not registry.get("active_bot"):
+            fallback = next(
+                (
+                    item
+                    for item in bots
+                    if isinstance(item, dict)
+                    and str((item.get("research") or {}).get("kind") or "") != "ai_bot_factory"
+                ),
+                None,
+            )
+            if fallback is None:
+                return {
+                    "enabled": True,
+                    "created": 0,
+                    "updated": 0,
+                    "errors": ["existing registry has no non-AI active bot"],
+                }
+            registry["active_bot"] = str(fallback.get("id"))
+        bot_manager.save_registry(registry, registry_path)
+        return {"enabled": True, "created": created, "updated": updated, "errors": []}
+
+    def _persist_ai_proposals_sync(self, proposals: list[dict[str, Any]]) -> dict[str, Any]:
+        existing_profiles = self.strategy_lab.list_profiles()
+        by_id = {
+            str(profile.get("id") or "").strip().lower(): profile
+            for profile in existing_profiles
+            if str(profile.get("id") or "").strip()
+        }
+        by_name = {
+            str(profile.get("name") or "").strip().casefold(): profile
+            for profile in existing_profiles
+            if str(profile.get("name") or "").strip()
+        }
+        saved_profiles: list[dict[str, Any]] = []
+        records: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        seen_names: set[str] = set()
+        deduplicated = 0
+        failed = 0
+        for index, proposal in enumerate(proposals):
+            try:
+                normalized = normalize_research_strategy_profile(proposal, index=index)
+                proposal_id = str(normalized["id"]).strip().lower()
+                name_key = str(normalized["name"]).strip().casefold()
+                existing = by_id.get(proposal_id) or by_name.get(name_key)
+                if proposal_id in seen_ids or name_key in seen_names:
+                    deduplicated += 1
+                    records.append({"id": proposal_id, "name": normalized["name"], "saved": False, "deduplicated": True})
+                    continue
+                seen_ids.add(proposal_id)
+                seen_names.add(name_key)
+                target_id = str(existing.get("id") or proposal_id).strip().lower() if existing else proposal_id
+                normalized["id"] = target_id
+                normalized["metadata"] = {
+                    **dict(normalized.get("metadata") or {}),
+                    "source": "ai_engine",
+                    "research_only": True,
+                }
+                saved = self.strategy_lab.save_profile(normalized, strategy_id=target_id)
+                safe_saved = {
+                    **saved,
+                    "enabled": False,
+                    "research_only": True,
+                    "real_account_allowed": False,
+                    "order_execution_allowed": False,
+                }
+                saved_profiles.append(safe_saved)
+                by_id[target_id] = saved
+                by_name[str(saved.get("name") or normalized["name"]).strip().casefold()] = saved
+                if existing is not None:
+                    deduplicated += 1
+                records.append(
+                    {
+                        "id": str(saved.get("id") or target_id),
+                        "name": str(saved.get("name") or normalized["name"]),
+                        "saved": True,
+                        "deduplicated": existing is not None,
+                        "status": "research_only",
+                    }
+                )
+            except Exception as exc:
+                failed += 1
+                records.append(
+                    {
+                        "id": str(proposal.get("id") or "")[:64],
+                        "name": str(proposal.get("name") or "")[:120],
+                        "saved": False,
+                        "deduplicated": False,
+                        "error": str(exc)[:240] or "proposal persistence failed",
+                    }
+                )
+
+        try:
+            registry_result = self._upsert_registry_profiles_sync(saved_profiles)
+        except Exception as exc:
+            registry_result = {
+                "enabled": bool(getattr(self.settings, "ai_bot_factory_registry_enabled", False)),
+                "created": 0,
+                "updated": 0,
+                "errors": [str(exc)[:240] or "registry update failed"],
+            }
+        return {
+            "validated": len(proposals),
+            "persisted": len(saved_profiles),
+            "deduplicated": deduplicated,
+            "failed": failed,
+            "records": records,
+            "profiles": saved_profiles,
+            "registry": registry_result,
+        }
+
+    async def _invoke_ai_engine(self, context: Mapping[str, Any], symbol: str) -> Any:
+        method = None
+        for name in ("safe_call_async", "analyze_async", "call_async", "safe_call", "analyze", "call"):
+            candidate = getattr(self.ai_engine, name, None)
+            if callable(candidate):
+                method = candidate
+                break
+        if method is None:
+            raise RuntimeError("AI engine has no callable analysis method")
+        kwargs: dict[str, Any] = {}
+        try:
+            signature = inspect.signature(method)
+            parameters = signature.parameters.values()
+            if "symbol" in signature.parameters or any(
+                parameter.kind == parameter.VAR_KEYWORD for parameter in parameters
+            ):
+                kwargs["symbol"] = symbol
+        except (TypeError, ValueError):
+            kwargs["symbol"] = symbol
+        if name.endswith("_async") or inspect.iscoroutinefunction(method):
+            result = method(context, **kwargs)
+        else:
+            result = await asyncio.to_thread(method, context, **kwargs)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
+    async def _run_ai_analysis(
+        self,
+        *,
+        symbol: str,
+        source: str,
+        scan_id: str | None = None,
+        job: ScanJob | None = None,
+        ohlcv: Any = None,
+        indicators: Any = None,
+        kronos_matrix: Any = None,
+        l2_dom: Any = None,
+        extra_context: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        normalized_symbol = str(symbol or self.settings.default_symbol).strip().upper()
+        self._ai_metrics["analyses_total"] += 1
+        bounded_bars = self._bound_ai_value(
+            list(ohlcv or [])[-int(getattr(self.settings, "ai_context_max_bars", 32)) :]
+            if isinstance(ohlcv, (list, tuple))
+            else [],
+        )
+        bounded_indicators = self._bound_ai_value(indicators or {})
+        bounded_kronos = self._bound_ai_value(kronos_matrix or {})
+        bounded_l2 = self._bound_ai_value(l2_dom or {})
+        extras = dict(extra_context or {})
+        extras.update(
+            {
+                "source": source,
+                "scan_id": scan_id,
+                "waterfall_step2": bounded_kronos,
+            }
+        )
+        try:
+            context = build_scan_context(
+                normalized_symbol,
+                bounded_bars,
+                bounded_indicators,
+                bounded_kronos,
+                bounded_l2,
+                **{str(key): self._bound_ai_value(value) for key, value in extras.items()},
+            )
+        except Exception as exc:
+            context = {
+                "symbol": normalized_symbol,
+                "ohlcv": [],
+                "indicators": {},
+                "kronos_matrix": {},
+                "l2_dom": {},
+                "research_only": True,
+            }
+            decision = self._blocked_ai_decision(f"context rejected: {exc}", symbol=normalized_symbol)
+        else:
+            decision: SafeDecision
+            raw_result: Any = None
+            if not bool(getattr(self.settings, "ai_enabled", True)):
+                decision = self._blocked_ai_decision("AI analysis is disabled by configuration", symbol=normalized_symbol)
+                self._ai_metrics["analyses_disabled"] += 1
+            else:
+                try:
+                    raw_result = await self._invoke_ai_engine(context, normalized_symbol)
+                    if isinstance(raw_result, SafeDecision):
+                        # Preserve the engine's explicit BLOCKED/offline
+                        # status; re-normalizing an ABSTAIN dict would turn a
+                        # fail-closed transport result into a generic
+                        # research decision.
+                        decision = (
+                            raw_result
+                            if raw_result.blocked
+                            else normalize_model_result(raw_result.to_dict(), symbol=normalized_symbol)
+                        )
+                    else:
+                        decision = normalize_model_result(raw_result, symbol=normalized_symbol)
+                except Exception as exc:
+                    decision = self._blocked_ai_decision(
+                        f"local model unavailable or unsafe: {exc}",
+                        symbol=normalized_symbol,
+                    )
+                    self._ai_metrics["last_error"] = str(exc)[:240]
+
+        if decision.blocked:
+            self._ai_metrics["analyses_blocked"] += 1
+        else:
+            self._ai_metrics["analyses_completed"] += 1
+        persistence: dict[str, Any] = {
+            "validated": 0,
+            "persisted": 0,
+            "deduplicated": 0,
+            "failed": 0,
+            "records": [],
+            "registry": {"enabled": False, "created": 0, "updated": 0, "errors": []},
+        }
+        proposals = [
+            self._redact_ai_value(proposal)
+            for proposal in list(decision.bot_proposals or [])
+            if isinstance(proposal, Mapping)
+        ]
+        proposals = [
+            {
+                **dict(proposal),
+                "enabled": False,
+                "research_only": True,
+                "real_account_allowed": False,
+                "order_execution_allowed": False,
+                "safety": {
+                    **dict(proposal.get("safety") or {}),
+                    "research_only": True,
+                    "real_account_allowed": False,
+                    "order_execution_allowed": False,
+                    "direct_python_orders": False,
+                },
+            }
+            for proposal in proposals
+            if isinstance(proposal, Mapping)
+        ]
+        self._ai_metrics["proposals_seen"] += len(proposals)
+        if proposals:
+            try:
+                persistence = await asyncio.to_thread(self._persist_ai_proposals_sync, proposals)
+                self._ai_metrics["proposals_persisted"] += int(persistence.get("persisted", 0))
+                self._ai_metrics["proposals_deduplicated"] += int(persistence.get("deduplicated", 0))
+                self._ai_metrics["proposals_failed"] += int(persistence.get("failed", 0))
+                registry_result = persistence.get("registry") or {}
+                self._ai_metrics["registry_profiles_created"] += int(registry_result.get("created", 0))
+                self._ai_metrics["registry_profiles_updated"] += int(registry_result.get("updated", 0))
+                for profile in persistence.get("profiles", []):
+                    profile_id = str(profile.get("id") or "").strip().lower()
+                    if profile_id:
+                        self._ai_proposal_profiles[profile_id] = self._ai_profile_view(profile)
+                self.mcp_server._strategy_proposals = [  # type: ignore[attr-defined]
+                    json_safe_copy(profile) for profile in self._ai_proposal_profiles.values()
+                ]
+                self._ai_proposal_records.extend(persistence.get("records", []))
+                self._ai_proposal_records = self._ai_proposal_records[-200:]
+            except Exception as exc:
+                persistence = {
+                    "validated": len(proposals),
+                    "persisted": 0,
+                    "deduplicated": 0,
+                    "failed": len(proposals),
+                    "records": [{"saved": False, "error": str(exc)[:240]}],
+                    "registry": {"enabled": False, "created": 0, "updated": 0, "errors": [str(exc)[:240]]},
+                }
+                self._ai_metrics["proposals_failed"] += len(proposals)
+                self._ai_metrics["last_error"] = str(exc)[:240]
+
+        self._ai_metrics["last_analysis_at"] = utc_now().isoformat()
+        decision_payload = self._redact_ai_value(decision.to_dict())
+        if not isinstance(decision_payload, dict):
+            decision_payload = {}
+        decision_payload["bot_proposals"] = json_safe_copy(proposals)
+        decision_payload.update(
+            {
+                "research_only": True,
+                "executable": False,
+                "execution_allowed": False,
+                "real_account_allowed": False,
+                "order_execution_allowed": False,
+            }
+        )
+        if not bool(getattr(self.settings, "ai_enabled", True)):
+            availability = "disabled"
+            status = "DISABLED"
+        elif decision.blocked:
+            availability = "offline" if bool(getattr(self.ai_engine, "offline", False)) else "blocked"
+            status = "BLOCKED"
+        else:
+            availability = "ready"
+            status = "RESEARCH_ONLY"
+        telemetry = {
+            "status": status,
+            "availability": availability,
+            "enabled": bool(getattr(self.settings, "ai_enabled", True)),
+            "model": str(getattr(self.ai_engine, "model", DEFAULT_OLLAMA_MODEL)),
+            "source": source,
+            "symbol": normalized_symbol,
+            "action": decision.action,
+            "confidence": decision.confidence,
+            "rationale": decision.reasoning_summary,
+            "decision": decision_payload,
+            "proposal_persistence": persistence,
+            "context": {
+                "ohlcv_bars": len(bounded_bars) if isinstance(bounded_bars, list) else 0,
+                "has_step1_indicators": bool(bounded_indicators),
+                "has_step2_kronos": bool(bounded_kronos),
+                "has_l2_snapshot": bool(bounded_l2),
+            },
+            "research_only": True,
+            "execution_allowed": False,
+            "real_account_allowed": False,
+            "order_execution_allowed": False,
+        }
+        await self._publish(
+            event(
+                "ai.engine.decision",
+                scan_id=scan_id,
+                source=source,
+                symbol=normalized_symbol,
+                status=status,
+                availability=availability,
+                action=decision.action,
+                confidence=decision.confidence,
+                rationale=decision.reasoning_summary,
+                proposal_count=len(proposals),
+                persisted_proposal_count=int(persistence.get("persisted", 0)),
+                research_only=True,
+                execution_allowed=False,
+            ),
+            job,
+        )
+        return telemetry
+
+    async def analyze_ai(
+        self,
+        symbol: str = "XAUUSD",
+        *,
+        context: Mapping[str, Any] | None = None,
+        source: str = "manual",
+        scan_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Run one bounded, read-only local AI analysis."""
+
+        normalized_symbol = str(symbol or self.settings.default_symbol).strip().upper()
+        supplied = dict(context or {})
+        bars = supplied.get("ohlcv", supplied.get("bars", []))
+        indicators = supplied.get("indicators", {})
+        kronos = supplied.get("kronos_matrix", supplied.get("waterfall_step2", {}))
+        l2 = supplied.get("l2_dom", supplied.get("l2_orderflow", {}))
+        extras = {
+            key: value
+            for key, value in supplied.items()
+            if key not in {"symbol", "ohlcv", "bars", "indicators", "kronos_matrix", "waterfall_step2", "l2_dom", "l2_orderflow"}
+        }
+        if not bars:
+            market_csv = self.settings.root / "TradingAgentsData" / "market" / f"{_safe_symbol_filename(normalized_symbol)}_m5.csv"
+            bars = await asyncio.to_thread(
+                self._read_latest_ohlcv_csv,
+                market_csv,
+                int(getattr(self.settings, "ai_context_max_bars", 32)),
+            )
+        if not indicators:
+            market_csv = self.settings.root / "TradingAgentsData" / "market" / f"{_safe_symbol_filename(normalized_symbol)}_m5.csv"
+            mt5_meta: dict[str, Any] = {}
+            try:
+                mt5_meta = await asyncio.to_thread(get_mt5_symbol_snapshot, normalized_symbol)
+            except Exception:
+                pass
+            step1 = await asyncio.to_thread(
+                TALibTechnicalEngine.evaluate_from_csv,
+                normalized_symbol,
+                market_csv,
+                fallback_close=float(mt5_meta.get("last_close") or 0.0),
+                fallback_atr=float(mt5_meta.get("atr_m5") or 0.0),
+            )
+            indicators = step1.to_dict()
+        if not l2:
+            l2 = self._latest_l2.get(normalized_symbol) or {}
+        if not kronos:
+            waterfall = self._read_json(self.waterfall_report_path) or {}
+            kronos = self._waterfall_step2(waterfall)
+            if not kronos:
+                latest_kronos = self._read_json(self.settings.report_dir / "kronos_matrix_latest.json") or {}
+                kronos = latest_kronos.get("decision", latest_kronos)
+        return await self._run_ai_analysis(
+            symbol=normalized_symbol,
+            source=source,
+            scan_id=scan_id,
+            ohlcv=bars,
+            indicators=indicators,
+            kronos_matrix=kronos,
+            l2_dom=l2,
+            extra_context=extras,
+        )
+
+    async def handle_mcp(self, request: Mapping[str, Any] | str) -> dict[str, Any] | None:
+        """Dispatch one local read-only MCP JSON-RPC request."""
+
+        return await self.mcp_server.handle_async(request)
 
     def update_controls(self, updates: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
         self.controls.update(updates, **kwargs)
@@ -1002,7 +1799,8 @@ class Orchestrator:
         if phase.get("fallback_after_failure"):
             return 2
         try:
-            return int(phase.get("return_code"))
+            value = phase.get("return_code")
+            return int(value) if value is not None else 2
         except (TypeError, ValueError):
             return 2
 
@@ -1366,6 +2164,29 @@ class Orchestrator:
                     job,
                 )
 
+        # Local AI is deliberately called only after the deterministic
+        # waterfall and any existing demo/shadow handling have completed. Its
+        # result is telemetry/research and cannot authorize or alter an order.
+        latest_ai_bars = await asyncio.to_thread(
+            self._read_latest_ohlcv_csv,
+            market_csv,
+            int(getattr(self.settings, "ai_context_max_bars", 32)),
+        )
+        ai_step2 = self._waterfall_step2(waterfall_dict)
+        if not ai_step2 and isinstance(kronos_report, dict):
+            ai_step2 = self._mapping_or_empty(kronos_report.get("decision", kronos_report))
+        ai_telemetry = await self._run_ai_analysis(
+            symbol=symbol,
+            source="scan",
+            scan_id=job.scan_id,
+            job=job,
+            ohlcv=latest_ai_bars,
+            indicators=step1_talib.to_dict(),
+            kronos_matrix=ai_step2,
+            l2_dom=l2_snapshot,
+            extra_context={"waterfall_action": final_act},
+        )
+
         result: dict[str, Any] = {
             "scan_id": job.scan_id,
             "symbol": symbol,
@@ -1374,6 +2195,8 @@ class Orchestrator:
             "autonomous_trade": autonomous_trade_result,
             "shadow_trade": shadow_trade_result,
             "gemini_review": gemini_review,
+            "ai": ai_telemetry,
+            "ai_engine": ai_telemetry,
             "mt5_sync": mt5_meta,
             "l2_orderflow": l2_snapshot,
             "execution_allowed": False,
@@ -1403,6 +2226,7 @@ class Orchestrator:
                 "tradingagents": trading_report,
                 "l2_orderflow": l2_snapshot,
                 "shadow_trade": shadow_trade_result,
+                "ai": ai_telemetry,
             },
             "result": (
                 "autonomous_demo_order_opened"
@@ -1493,6 +2317,7 @@ class Orchestrator:
             "paused": self.paused,
             "telegram": self.telegram.status_summary(),
             "controls": self.controls.snapshot(),
+            "ai": self.ai_status(),
             "decision_history_summary": self.decision_history_summary(),
             "decision_history": self.decision_history(20)["records"],
             "execution_allowed": False,
@@ -1787,6 +2612,7 @@ class Orchestrator:
             ),
             "gemini": self.gemini_cio.gemini_status(),
             "controls": self.controls.snapshot(),
+            "ai": self.ai_status(),
             "decision_history_summary": self.decision_history_summary(),
             "decision_history": self.decision_history(20)["records"],
             "last_cycle": cached,
@@ -2054,6 +2880,25 @@ class Orchestrator:
                         )
                     )
 
+            # Run the local research-only AI after this pair's waterfall. The
+            # screener's existing execution/shadow branch is already complete,
+            # so this analysis cannot unlock or modify a trade.
+            latest_ai_bars = await asyncio.to_thread(
+                self._read_latest_ohlcv_csv,
+                target_csv,
+                int(getattr(self.settings, "ai_context_max_bars", 32)),
+            )
+            ai_telemetry = await self._run_ai_analysis(
+                symbol=sym,
+                source="screener",
+                scan_id=cycle_id,
+                ohlcv=latest_ai_bars,
+                indicators=step1_talib.to_dict(),
+                kronos_matrix=self._waterfall_step2(wf_dict),
+                l2_dom=l2_snap,
+                extra_context={"waterfall_action": wf_decision.final_action},
+            )
+
             pair_summary = {
                 "symbol": sym,
                 "final_action": wf_decision.final_action,
@@ -2079,6 +2924,8 @@ class Orchestrator:
                     wf_decision.step2_kronos_matrix,
                 ),
                 "waterfall": wf_dict,
+                "ai": ai_telemetry,
+                "ai_engine": ai_telemetry,
             }
             outcome = self._decision_outcome(
                 wf_dict,
@@ -2120,6 +2967,16 @@ class Orchestrator:
             "auto_executed_trades": auto_executed_trades,
             "shadow_logged_count": len(shadow_trades),
             "shadow_trades": shadow_trades,
+            "ai": {
+                "analyses": len(pair_results),
+                "research_only": True,
+                "execution_allowed": False,
+                "proposals_persisted": sum(
+                    int((item.get("ai") or {}).get("proposal_persistence", {}).get("persisted", 0))
+                    for item in pair_results
+                    if isinstance(item, dict)
+                ),
+            },
             "controls": self.controls.snapshot(),
             "decision_history_summary": self.decision_history_summary(),
             "results": pair_results,

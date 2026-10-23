@@ -23,6 +23,7 @@ env/
 chroma_db/
 TradingAgentsData/memory/
 TradingAgentsData/reports/
+TradingAgentsData/strategies/
 KronosData/
 KronosData/hf-cache/
 *.log

@@ -104,6 +104,9 @@ def add_bot_profile(
 def set_bot_enabled(bot_id: str, enabled: bool, *, path: Path = REGISTRY_PATH) -> dict[str, Any]:
     registry = load_json(path)
     bot = bot_by_id(registry, _normalize_bot_id(bot_id))
+    research = bot.get("research") or {}
+    if isinstance(research, dict) and research.get("kind") == "ai_bot_factory":
+        raise ValueError("AI bot-factory proposals are permanently research-only and cannot be changed")
     bot["enabled"] = bool(enabled)
     if not bot["enabled"]:
         bot["status"] = "disabled"
@@ -182,10 +185,26 @@ def validate_registry(registry: dict[str, Any]) -> list[str]:
         safety = bot.get("safety") or {}
         if safety.get("real_account_allowed") is not False:
             errors.append(f"{bot_id} must keep real_account_allowed=false")
+        research = bot.get("research") or {}
+        if isinstance(research, dict) and research.get("kind") == "ai_bot_factory":
+            if bot.get("status") != "research_only":
+                errors.append(f"{bot_id} AI bot-factory profile must remain research_only")
+            if bot.get("enabled") is not False:
+                errors.append(f"{bot_id} AI bot-factory profile must remain disabled")
+            if safety.get("order_execution_allowed") is not False:
+                errors.append(f"{bot_id} AI bot-factory profile must keep order_execution_allowed=false")
 
     active = registry.get("active_bot")
     if active not in ids:
         errors.append(f"active_bot is not registered: {active}")
+    elif any(
+        isinstance(bot, dict)
+        and bot.get("id") == active
+        and isinstance(bot.get("research"), dict)
+        and bot["research"].get("kind") == "ai_bot_factory"
+        for bot in bots
+    ):
+        errors.append("AI bot-factory proposals cannot be the active bot")
     return errors
 
 

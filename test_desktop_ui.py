@@ -858,6 +858,134 @@ class DesktopUiTests(unittest.TestCase):
         finally:
             panel.close()
 
+    def test_phase3_local_ai_panel_uses_threaded_transport_and_safe_context(self) -> None:
+        from unittest.mock import patch
+
+        window = NewEraDesktopTerminal(
+            api_url="http://127.0.0.1:59999",
+            ws_url="ws://127.0.0.1:59999/ws/logs",
+        )
+        try:
+            panel = window.strategy_lab_panel
+            panel.set_active_symbol("EURUSD")
+            window._latest_ai_gate_context = {
+                "action": "BUY",
+                "confidence": 0.82,
+                "kronos_action": "BUY",
+                "kronos_confidence": 0.80,
+                "risk_tier": "STANDARD_RISK",
+            }
+            window._latest_l2_snapshot = {
+                "symbol": "EURUSD",
+                "best_bid": 1.1000,
+                "best_ask": 1.1002,
+                "l2_direction": "BUY",
+                "veto_buy": False,
+            }
+            window._latest_symbol_spec = {
+                "symbol": "EURUSD",
+                "bid": 1.1000,
+                "ask": 1.1002,
+                "atr_m5": 0.0012,
+                "digits": 5,
+            }
+            window._latest_mt5_account = {"login": 53012933, "company": "private account data"}
+
+            with patch.object(window, "_spawn_http_task") as spawn:
+                panel.refresh_ai_status_button.click()
+                panel.run_local_ai_analysis_button.click()
+                panel.refresh_ai_proposals_button.click()
+
+            task_names = [call.args[0] for call in spawn.call_args_list]
+            self.assertIn("ai_status", task_names)
+            self.assertIn("ai_analyze", task_names)
+            self.assertIn("ai_proposals", task_names)
+
+            analyze_call = next(call for call in spawn.call_args_list if call.args[0] == "ai_analyze")
+            self.assertEqual(analyze_call.args[1:3], ("POST", "/ai/analyze"))
+            request_payload = analyze_call.kwargs["payload"]
+            self.assertEqual(request_payload["symbol"], "EURUSD")
+            encoded = json.dumps(request_payload, ensure_ascii=False)
+            self.assertNotIn("53012933", encoded)
+            self.assertNotIn("private account data", encoded)
+            self.assertNotIn("<think>", encoded)
+            self.assertFalse(request_payload["context"]["execution_allowed"])
+
+            panel.set_ai_status(
+                {
+                    "enabled": True,
+                    "offline": False,
+                    "model": "deepseek-r1:latest",
+                    "ai_bot_factory": {"status": "ready", "counts": {"strategy_profiles": 2}},
+                }
+            )
+            self.assertEqual(panel.ai_status_badge.text(), "ONLINE")
+            self.assertIn("deepseek-r1", panel.ai_model_label.text())
+            self.assertEqual(panel.ai_proposal_count_label.text(), "PROPOSALS: 2")
+
+            panel.set_ai_result(
+                {
+                    "symbol": "EURUSD",
+                    "status": "RESEARCH_ONLY",
+                    "availability": "ready",
+                    "action": "BUY",
+                    "confidence": 0.84,
+                    "rationale": "<think>private chain</think>Public breakout rationale.",
+                    "decision": {
+                        "risk_pct": 0.75,
+                        "min_rr": 1.8,
+                        "max_sl_atr": 2.0,
+                        "time_stop_minutes": 90,
+                        "bot_proposals": [{"id": "range-study", "name": "Range Study"}],
+                    },
+                    "proposal_count": 1,
+                }
+            )
+            self.assertEqual(panel.ai_decision_label.text(), "BUY")
+            self.assertEqual(panel.ai_confidence_label.text(), "84.0%")
+            self.assertEqual(panel.ai_risk_label.text(), "0.75%")
+            self.assertEqual(panel.ai_rr_label.text(), "≥ 1.80 R")
+            self.assertEqual(panel.ai_sl_label.text(), "≤ 2.00x ATR")
+            self.assertEqual(panel.ai_time_stop_label.text(), "90 min")
+            self.assertIn("Public breakout rationale", panel.ai_rationale_view.toPlainText())
+            self.assertNotIn("private chain", panel.ai_rationale_view.toPlainText())
+            self.assertIn("ORDER EXECUTION DISABLED", panel.ai_guard_label.text())
+
+            panel.set_ai_proposals(
+                {"count": 1, "proposals": [{"id": "range-study", "name": "Range Study", "symbol": "EURUSD"}]}
+            )
+            self.assertIn("range-study", panel.ai_proposals_view.toPlainText())
+        finally:
+            window.close()
+
+    def test_phase3_ai_engine_websocket_event_updates_panel_and_logs(self) -> None:
+        window = NewEraDesktopTerminal(
+            api_url="http://127.0.0.1:59999",
+            ws_url="ws://127.0.0.1:59999/ws/logs",
+        )
+        try:
+            window._on_ws_event_received(
+                {
+                    "type": "ai.engine.decision",
+                    "timestamp": time.time(),
+                    "payload": {
+                        "symbol": "XAUUSD",
+                        "status": "RESEARCH_ONLY",
+                        "availability": "ready",
+                        "action": "SELL",
+                        "confidence": 0.73,
+                        "proposal_count": 3,
+                        "rationale": "Local research-only sell setup.",
+                    },
+                }
+            )
+            self.assertEqual(window.strategy_lab_panel.ai_decision_label.text(), "SELL")
+            self.assertEqual(window.strategy_lab_panel.ai_confidence_label.text(), "73.0%")
+            self.assertIn("AI.ENGINE", window.log_all.toPlainText())
+            self.assertIn("Local research-only sell setup.", window.log_system.toPlainText())
+        finally:
+            window.close()
+
 
 if __name__ == "__main__":
     unittest.main()

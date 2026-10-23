@@ -1016,6 +1016,10 @@ class NewEraDesktopTerminal(QMainWindow):
         self._l2_alert_count = 0
         self._latest_l2_snapshot: dict[str, Any] = {}
         self._latest_mt5_account: dict[str, Any] = {}
+        self._latest_ai_gate_context: dict[str, Any] = {}
+        self._latest_gates_snapshot: dict[str, Any] = {}
+        self._latest_waterfall: dict[str, Any] = {}
+        self._latest_ai_result: dict[str, Any] = {}
         self._latest_gate_action: str = "ABSTAIN"
         self._latest_ai_direction: str = "BUY"
         self._computed_lot_size: float = 0.01
@@ -1204,11 +1208,17 @@ class NewEraDesktopTerminal(QMainWindow):
         self.bot_strategy_lab_panel = self.strategy_lab_panel
         self.strategy_lab_widget = self.strategy_lab_panel
         self.strategy_backtester_panel = self.strategy_lab_panel
+        self.ai_engine_panel = self.strategy_lab_panel
+        self.ai_bot_factory_panel = self.strategy_lab_panel
         self.strategy_lab_panel.tool_requested.connect(self._on_strategy_lab_tool_requested)
         self.strategy_lab_panel.strategy_save_requested.connect(self._request_strategy_save)
         self.strategy_lab_panel.strategy_backtest_requested.connect(self._request_strategy_backtest)
         self.strategy_lab_panel.strategy_walk_forward_requested.connect(self._request_strategy_walk_forward)
         self.strategy_lab_panel.strategy_load_requested.connect(self._request_strategy_load)
+        self.strategy_lab_panel.ai_status_requested.connect(self._request_ai_status)
+        self.strategy_lab_panel.ai_analysis_requested.connect(self._request_ai_analysis)
+        self.strategy_lab_panel.ai_proposals_requested.connect(self._request_ai_proposals)
+        self.strategy_lab_panel.set_active_symbol(self.ticker_combo.currentText())
 
         self.live_chart_dock = self._create_phase3_dock(
             "LiveChartExecutionDock",
@@ -2250,6 +2260,8 @@ class NewEraDesktopTerminal(QMainWindow):
             return
         normalized = symbol.strip().upper() or "XAUUSD"
         self.phase2_live_tab.set_symbol(normalized)
+        if hasattr(self, "strategy_lab_panel"):
+            self.strategy_lab_panel.set_active_symbol(normalized)
 
     def _on_phase2_symbol_changed(self, symbol: str) -> None:
         normalized = symbol.strip().upper()
@@ -2294,6 +2306,174 @@ class NewEraDesktopTerminal(QMainWindow):
             timeout=10.0,
         )
         self._spawn_http_task("decision_history_summary", "GET", "/decision-history/summary", timeout=10.0)
+
+    def _request_ai_status(self) -> None:
+        if hasattr(self, "strategy_lab_panel"):
+            self.strategy_lab_panel.set_ai_transport_status("Queueing GET /ai/status…")
+        self._spawn_http_task("ai_status", "GET", "/ai/status", timeout=8.0)
+
+    def _request_ai_proposals(self) -> None:
+        if hasattr(self, "strategy_lab_panel"):
+            self.strategy_lab_panel.set_ai_transport_status("Queueing GET /ai/proposals…")
+        self._spawn_http_task("ai_proposals", "GET", "/ai/proposals", timeout=12.0)
+
+    def _build_ai_analysis_payload(self, symbol: str | None = None) -> dict[str, Any]:
+        """Build a bounded, public-only context for the local research advisor."""
+
+        active_symbol = str(symbol or self.ticker_combo.currentText() or "XAUUSD").strip().upper() or "XAUUSD"
+        gates = self._latest_ai_gate_context if isinstance(self._latest_ai_gate_context, dict) else {}
+        market = self._latest_symbol_spec if isinstance(self._latest_symbol_spec, dict) else {}
+        latest_l2 = self._latest_l2_snapshot if isinstance(self._latest_l2_snapshot, dict) else {}
+        waterfall = self._latest_waterfall if isinstance(self._latest_waterfall, dict) else {}
+
+        def finite_number(value: Any) -> int | float | None:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(number):
+                return None
+            return int(number) if number.is_integer() else number
+
+        def copy_fields(source: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key in keys:
+                if key not in source:
+                    continue
+                value = source.get(key)
+                if isinstance(value, (bool, str, int)):
+                    result[key] = value
+                    continue
+                number = finite_number(value)
+                if number is not None:
+                    result[key] = number
+            return result
+
+        safe_gates = copy_fields(
+            gates,
+            (
+                "action",
+                "confidence",
+                "ta_action",
+                "ta_confidence",
+                "kronos_action",
+                "kronos_confidence",
+                "kronos_score",
+                "matrix_direction",
+                "matrix_score",
+                "analog_direction",
+                "analog_win_rate",
+                "forecast_direction",
+                "forecast_move_atr",
+                "forecast_path_agreement",
+                "waterfall_action",
+                "waterfall_confidence",
+                "risk_tier",
+                "l2_direction",
+            ),
+        )
+        safe_gates["symbol"] = active_symbol
+
+        safe_kronos = {
+            key: safe_gates[key]
+            for key in (
+                "kronos_action",
+                "kronos_confidence",
+                "kronos_score",
+                "matrix_direction",
+                "matrix_score",
+                "analog_direction",
+                "analog_win_rate",
+                "forecast_direction",
+                "forecast_move_atr",
+                "forecast_path_agreement",
+            )
+            if key in safe_gates
+        }
+        safe_kronos["symbol"] = active_symbol
+
+        steps_value = waterfall.get("steps")
+        steps: dict[str, Any] = steps_value if isinstance(steps_value, dict) else waterfall
+        step1_value = steps.get("step1_talib")
+        step1: dict[str, Any] = step1_value if isinstance(step1_value, dict) else {}
+        safe_indicators = copy_fields(
+            step1,
+            ("trend_bias", "rsi_14", "atr_14", "adx_14", "filter_score", "technical_score"),
+        )
+        safe_indicators["symbol"] = active_symbol
+
+        safe_l2 = copy_fields(
+            latest_l2,
+            (
+                "symbol",
+                "source",
+                "digits",
+                "best_bid",
+                "best_ask",
+                "mid_price",
+                "spread",
+                "total_bid_volume",
+                "total_ask_volume",
+                "bid_pressure_pct",
+                "ask_pressure_pct",
+                "imbalance_ratio",
+                "l2_direction",
+                "confluence_score",
+                "veto_buy",
+                "veto_sell",
+            ),
+        )
+        safe_l2["symbol"] = active_symbol
+        for wall_key in ("nearest_buy_wall", "nearest_sell_wall", "strongest_buy_wall", "strongest_sell_wall"):
+            wall = latest_l2.get(wall_key)
+            if not isinstance(wall, dict):
+                continue
+            safe_wall = copy_fields(wall, ("price", "volume"))
+            if safe_wall:
+                safe_l2[wall_key] = safe_wall
+
+        safe_mt5 = copy_fields(
+            market,
+            (
+                "digits",
+                "point",
+                "bid",
+                "ask",
+                "spread_points",
+                "atr_m5",
+                "last_close",
+                "range_20_low",
+                "range_20_high",
+                "volume_min",
+                "volume_max",
+                "volume_step",
+            ),
+        )
+        safe_mt5["symbol"] = active_symbol
+
+        context = {
+            "symbol": active_symbol,
+            "research_only": True,
+            "execution_allowed": False,
+            "gates": safe_gates,
+            "kronos_matrix": safe_kronos,
+            "indicators": safe_indicators,
+            "l2_dom": safe_l2,
+            "mt5": safe_mt5,
+        }
+        return {"symbol": active_symbol, "context": context}
+
+    def _request_ai_analysis(self, symbol: str | None = None) -> None:
+        active_symbol = str(symbol or self.ticker_combo.currentText() or "XAUUSD").strip().upper() or "XAUUSD"
+        if hasattr(self, "strategy_lab_panel"):
+            self.strategy_lab_panel.set_ai_transport_status(f"Queueing POST /ai/analyze for {active_symbol}…")
+        self._spawn_http_task(
+            "ai_analyze",
+            "POST",
+            "/ai/analyze",
+            payload=self._build_ai_analysis_payload(active_symbol),
+            timeout=45.0,
+        )
 
     def _handle_bot_fleet_action(self, action: str, payload: dict[str, Any]) -> None:
         """Persist a fleet action through the safe bot-registry API."""
@@ -3723,6 +3903,8 @@ class NewEraDesktopTerminal(QMainWindow):
             "/gates/latest",
             include_local_kronos_snapshot=True,
         )
+        self._request_ai_status()
+        self._request_ai_proposals()
         self._spawn_http_task("scans_list", "GET", "/scans")
         if not self._memory_records and self.memory_query_input.text().strip():
             self.trigger_memory_search()
@@ -3865,6 +4047,18 @@ class NewEraDesktopTerminal(QMainWindow):
     def _on_http_succeeded(self, task_name: str, data: object) -> None:
         if task_name == "health" and isinstance(data, dict):
             self._update_health_ui(data)
+        elif task_name == "ai_status" and isinstance(data, dict):
+            self.strategy_lab_panel.set_ai_status(data)
+        elif task_name == "ai_proposals" and isinstance(data, dict):
+            self.strategy_lab_panel.set_ai_proposals(data)
+        elif task_name == "ai_analyze" and isinstance(data, dict):
+            self._latest_ai_result = dict(data)
+            self.strategy_lab_panel.set_ai_result(data)
+            self.status_message_label.setText(
+                f"Local AI analysis complete: {data.get('symbol', self.ticker_combo.currentText())} "
+                f"{str(data.get('action') or 'ABSTAIN').upper()} ({data.get('status', 'RESEARCH_ONLY')})."
+            )
+            self._request_ai_proposals()
         elif task_name == "controls_get" and isinstance(data, dict):
             self._update_phase2_controls_ui(data)
         elif task_name == "controls_update" and isinstance(data, dict):
@@ -4026,6 +4220,9 @@ class NewEraDesktopTerminal(QMainWindow):
             self._apply_pill_style(self.api_status_badge, "offline")
             self.status_api_label.setText("API: OFFLINE")
             self.status_message_label.setText(f"API unreachable ({self.api_url}): {error_text}")
+        elif task_name in {"ai_status", "ai_proposals", "ai_analyze"}:
+            self.strategy_lab_panel.set_ai_error(task_name, error_text)
+            self.status_message_label.setText(f"Local AI {task_name.replace('_', ' ')} failed: {error_text}")
         elif task_name in {"strategies_list", "strategy_save", "strategy_load", "strategy_backtest", "strategy_walk_forward"}:
             self.strategy_lab_panel.set_backend_error(task_name, error_text)
             self.status_message_label.setText(f"Strategy Lab request failed: {error_text}")
@@ -4642,6 +4839,7 @@ class NewEraDesktopTerminal(QMainWindow):
             self.layer_matrix_bar.setValue(0)
 
         # 2. Historical Analogue Layer Bar
+        wr_pct = 0.0
         if analog_obj:
             a_dir = str(analog_obj.get("direction", "ABSTAIN")).upper()
             a_samples = int(self._safe_float(analog_obj.get("sample_count", 0)))
@@ -4658,6 +4856,7 @@ class NewEraDesktopTerminal(QMainWindow):
             self.layer_analog_bar.setValue(0)
 
         # 3. Kronos Transformer Layer Bar
+        f_agree = 0.0
         if forecast_obj:
             f_dir = str(forecast_obj.get("direction", "ABSTAIN")).upper()
             f_atr = forecast_obj.get("move_atr")
@@ -4756,6 +4955,37 @@ class NewEraDesktopTerminal(QMainWindow):
             self._latest_ai_direction = f_dir_txt
         elif m_dir_txt in {"BUY", "SELL"}:
             self._latest_ai_direction = m_dir_txt
+
+        # Keep a bounded, public-only gate snapshot for the optional local AI
+        # advisor.  Free-form rationale and account data never enter this
+        # transport context.
+        self._latest_gates_snapshot = {
+            "symbol": active_symbol,
+            "action": primary_action,
+            "confidence": primary_conf,
+            "risk_tier": wf_tier,
+        }
+        self._latest_ai_gate_context = {
+            "symbol": active_symbol,
+            "action": primary_action,
+            "confidence": primary_conf,
+            "ta_action": ta_action,
+            "ta_confidence": ta_conf,
+            "kronos_action": km_action,
+            "kronos_confidence": km_conf,
+            "kronos_score": km_score,
+            "matrix_direction": m_dir_txt,
+            "matrix_score": self._safe_float(matrix_obj.get("score", 0.0)),
+            "analog_direction": a_dir_txt,
+            "analog_win_rate": wr_pct,
+            "forecast_direction": f_dir_txt,
+            "forecast_move_atr": self._safe_float(forecast_obj.get("move_atr", 0.0)),
+            "forecast_path_agreement": f_agree,
+            "waterfall_action": str(waterfall_obj.get("final_action") or "ABSTAIN").upper(),
+            "waterfall_confidence": self._safe_float(waterfall_obj.get("win_probability_pct", 0.0)) / 100.0,
+            "risk_tier": wf_tier,
+            "l2_direction": l2_dir_txt,
+        }
 
         # Autonomous execution is owned by the backend waterfall path.  A gate
         # refresh is display state only: triggering the manual demo endpoint
@@ -4988,6 +5218,26 @@ class NewEraDesktopTerminal(QMainWindow):
             else datetime.now().strftime("%H:%M:%S")
         )
 
+        if event_type == "ai.engine.decision":
+            event_symbol = str(payload.get("symbol") or "").strip().upper()
+            active_symbol = self.ticker_combo.currentText().strip().upper() or "XAUUSD"
+            action = str(payload.get("action") or "ABSTAIN").upper()
+            status = str(payload.get("status") or payload.get("availability") or "RESEARCH_ONLY").upper()
+            confidence = self._safe_float(payload.get("confidence", 0.0))
+            confidence_pct = confidence * 100.0 if abs(confidence) <= 1.0 else confidence
+            proposal_count = payload.get("proposal_count", 0)
+            rationale = self._safe_ai_text(payload.get("rationale"), "No public rationale supplied.")
+            if not event_symbol or event_symbol == active_symbol:
+                self._latest_ai_result = dict(payload)
+                self.strategy_lab_panel.set_ai_decision_event(payload)
+            color = "#10b981" if action == "BUY" else ("#ef4444" if action == "SELL" else "#f59e0b")
+            log_message = (
+                f"{event_symbol or active_symbol} {action} [{status}] — confidence={confidence_pct:.1f}% "
+                f"proposals={proposal_count} — {rationale}"
+            )
+            self._append_log_entry(self.log_all, "AI.ENGINE", log_message, color, time_str=time_str)
+            self._append_log_entry(self.log_system, "AI.ENGINE", log_message, color, time_str=time_str)
+            return
         if event_type == "trade.decision":
             decision_record = payload.get("record") if isinstance(payload.get("record"), dict) else payload
             if isinstance(decision_record, dict):
@@ -5267,6 +5517,19 @@ class NewEraDesktopTerminal(QMainWindow):
             return float(value)
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _safe_ai_text(value: Any, default: str = "", limit: int = 320) -> str:
+        """Render only concise public AI text; never expose hidden reasoning blocks."""
+
+        text = str(value or "").strip()
+        text = re.sub(r"<(?:think|analysis)>.*?</(?:think|analysis)>", "", text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"<(?:think|analysis)>.*$", "", text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"</(?:think|analysis)>", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) > limit:
+            return text[:limit].rstrip() + "…"
+        return text or default
 
     # -----------------------------------------------------------------------
     # Clean Shutdown

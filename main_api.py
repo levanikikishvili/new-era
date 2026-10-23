@@ -28,6 +28,7 @@ from newera_api.mt5_bridge import get_mt5_status, get_mt5_symbol_snapshot
 from newera_api.orchestrator import Orchestrator
 from newera_api.schemas import (
     AutonomousModeRequest,
+    AIAnalyzeRequest,
     BotEnabledRequest,
     BotProfileCreateRequest,
     ControlsUpdateRequest,
@@ -106,7 +107,36 @@ async def health() -> dict[str, Any]:
         "controls": orchestrator.get_controls(),
         "decision_history_summary": orchestrator.decision_history_summary(),
         "decision_history_path": str(settings.decision_history_path),
+        "ai": orchestrator.ai_status(),
+        "ai_bot_factory": orchestrator.ai_status()["ai_bot_factory"],
     }
+
+
+@app.get("/ai/status")
+async def ai_status_endpoint() -> dict[str, Any]:
+    return orchestrator.ai_status()
+
+
+@app.get("/ai/proposals")
+async def ai_proposals_endpoint() -> dict[str, Any]:
+    return await orchestrator.get_ai_proposals()
+
+
+@app.post("/ai/analyze")
+async def ai_analyze_endpoint(request: AIAnalyzeRequest) -> dict[str, Any]:
+    context = dict(request.context)
+    for key in ("ohlcv", "indicators", "kronos_matrix", "l2_dom"):
+        value = getattr(request, key)
+        if value is not None:
+            context[key] = value
+    return await orchestrator.analyze_ai(request.symbol, context=context, source="manual")
+
+
+@app.post("/mcp")
+async def mcp_endpoint(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Expose the in-process read-only MCP JSON-RPC facade over the local API."""
+
+    return await orchestrator.handle_mcp(payload)
 
 
 @app.get("/controls")
