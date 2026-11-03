@@ -48,7 +48,8 @@
       "safety": {
         "real_account_allowed": false,
         "direct_python_orders": false
-      }
+      },
+      "enabled": true
     },
     {
       "id": "xauusd-asia-research-candidate",

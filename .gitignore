@@ -41,3 +41,10 @@ dist/
 .vscode/
 .DS_Store
 Thumbs.db
+
+.env
+.env.*
+!.env.example
+providers.env
+.venv-api/
+__pycache__/
