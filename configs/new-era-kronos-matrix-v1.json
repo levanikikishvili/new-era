@@ -51,7 +51,7 @@
     "maximum_risk_percent": 0.50,
     "maximum_spread_points": 35.0,
     "maximum_spread_to_atr": 0.08,
-    "reward_risk": 1.0,
+    "reward_risk": 1.5,
     "daily_loss_limit": 10.0,
     "real_account_allowed": false
   },

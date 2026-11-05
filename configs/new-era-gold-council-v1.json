@@ -20,7 +20,7 @@
     "maximum_daily_loss_money": 10.0,
     "maximum_consecutive_losses": 2,
     "stop_loss_atr_multiplier": 1.5,
-    "reward_risk": 1.0,
+    "reward_risk": 1.5,
     "maximum_spread_points": 50.0
   },
   "ai_research": {

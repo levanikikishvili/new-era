@@ -40,10 +40,13 @@ from .ai_engine import (
     normalize_research_strategy_profile,
 )
 from .bot_lab import StrategyLab
+from .bot_performance_intelligence import BotPerformanceIntelligenceEngine
 from .config import ApiSettings, load_workspace_dotenv
 from .controls import RuntimeControls
 from .events import EventBus, event
+from .external_bot_hub import MultiBotIntegrationHub
 from .gemini_manager import GeminiPortfolioManager, Step1TALibResult, TALibTechnicalEngine
+from .historical_intelligence import HistoricalIntelligenceEngine
 from .memory import MemoryStore
 from .mcp_server import MCPServer
 from .mt5_bridge import (
@@ -57,6 +60,7 @@ from .mt5_bridge import (
     manage_mt5_demo_positions,
 )
 from .orderflow_agent import OrderflowAnalysis, OrderflowLiquidityAgent, resolve_crypto_pair
+from .saas_architecture import SaaSArchitectureManager
 from .telegram_bot import TelegramRemoteController
 from .trade_logger import TradeDecisionLogger
 
@@ -203,6 +207,10 @@ class Orchestrator:
         )
         self.orderflow = OrderflowLiquidityAgent()
         self.gemini_cio = GeminiPortfolioManager(self.settings.root)
+        self.historical_intelligence = HistoricalIntelligenceEngine(self.settings.root)
+        self.bot_intelligence = BotPerformanceIntelligenceEngine(self.settings.root)
+        self.multi_bot_hub = MultiBotIntegrationHub(self.settings.root)
+        self.saas = SaaSArchitectureManager(self.settings.root)
         self.telegram = TelegramRemoteController(self.settings.root)
         self.telegram.set_command_handler(self._handle_telegram_command)
         self.controls = RuntimeControls()
@@ -2634,11 +2642,13 @@ class Orchestrator:
         if self._screener_running:
             return
         self._screener_running = True
+        self.multi_bot_hub.start_auto_fleet_loop(interval_seconds=12.0)
         self._gemini_warmup_task = asyncio.create_task(self._warmup_gemini_connection())
         self._screener_task = asyncio.create_task(self._autonomous_screener_loop())
 
     async def stop_autonomous_screener(self) -> None:
         self._screener_running = False
+        self.multi_bot_hub.stop_auto_fleet_loop()
         if self._screener_task is not None:
             self._screener_task.cancel()
             try:

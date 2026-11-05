@@ -23,10 +23,12 @@
 - `AllowRealAccount=false` არის.
 - real account-ზე EA ინიციალიზაციას შეწყვეტს.
 - default risk არის 0.5%, maximum 1%.
+- minimum reward:risk არის 1.5; `RewardRisk`-ის დაბალი მნიშვნელობა ინიციალიზაციას ბლოკავს.
 - დღიური loss limit არის 10 ანგარიშის ვალუტაში.
 - ერთდროულად მხოლოდ ერთი პოზიციაა.
 - მოგებიან trade-ს დროის გამო ავტომატურად არ ხურავს; time guard მხოლოდ წაგებიან პოზიციას ხურავს.
 - ეს არის deterministic `Council-lite` EA: H4, H1, M15 და M5 votes + ATR/spread guard. Python AI model-ს პირდაპირ არ ტვირთავს.
+- chart-ზე ჩანს ბოლო დახურული M5 candle-ის execution diagnostic panel; structured CSV იწერება MT5 Common Files-ში.
 
 ## TradingView-ში ტესტირება
 

@@ -1046,9 +1046,31 @@ def _enrich_position_metrics(
         "partial_closed_50": bool(raw.get("partial_closed_50", False)),
         "realized_partial_profit": round(float(raw.get("realized_partial_profit") or 0.0), 2),
         "opened_at": str(raw.get("opened_at") or datetime.now(timezone.utc).isoformat()),
-        "comment": str(raw.get("comment") or "NewEraQuantDemo"),
+        "magic": int(raw.get("magic") or 0),
+        "comment": str(raw.get("comment") or (f"Magic:{int(raw.get('magic'))}" if raw.get("magic") else "Manual / External")),
+        "bot_label": _resolve_position_bot_label(str(raw.get("comment") or ""), int(raw.get("magic") or 0)),
         "source": str(raw.get("source") or "mt5_terminal"),
     }
+
+
+def _resolve_position_bot_label(comment: str, magic: int) -> str:
+    upper = (comment or "").strip().upper()
+    if magic == 11032026 or "XAU_M1_DEMO" in upper or "BREAKOUTSTOPS" in upper:
+        leg = "BuyStop" if "_BS" in upper else ("SellStop" if "_SS" in upper else "M1")
+        return f"XAUUSD_M1_BreakoutStops ({leg})"
+    if magic in (16155444, 16155405) or str(magic).startswith("161554") or "EFH1" in upper:
+        return "AdaptiveH1Breakout (EFH1)"
+    if magic == 20241002 or "SNIPER" in upper:
+        return "Gold_Sniper_Scalper v3.7"
+    if "JOEYCIO" in upper:
+        return comment.strip() or "JoeyCIO"
+    if "AUTOSCREENER" in upper:
+        return comment.strip() or "AutoScreener"
+    if "NEWERA" in upper or magic == DEMO_MAGIC_NUMBER:
+        return comment.strip() or "NewEraQuantDemo"
+    if magic and magic != 0:
+        return f"{comment.strip() or 'MQL5 EA'} (#{magic})"
+    return comment.strip() or "Manual / External"
 
 
 def compute_dynamic_position_adjustment(
@@ -1203,7 +1225,8 @@ def _inprocess_positions(symbol: str | None = None) -> dict[str, Any]:
                         "profit": float(pos.profit),
                         "swap": float(getattr(pos, "swap", 0.0)),
                         "opened_at": datetime.fromtimestamp(int(pos.time), timezone.utc).isoformat(),
-                        "comment": str(getattr(pos, "comment", "") or "NewEraQuantDemo"),
+                        "magic": int(getattr(pos, "magic", 0) or 0),
+                        "comment": str(getattr(pos, "comment", "") or ""),
                         "source": "mt5_terminal",
                     }
                 )
@@ -1302,10 +1325,14 @@ def _inprocess_manage_demo_positions(
         time_stop_closed_tickets: list[int] = []
         time_stop_errors: list[str] = []
 
-        # 1. Manage live MT5 terminal positions on Demo account
+        # 1. Manage live MT5 terminal positions on Demo account (skip positions owned by external MQL5 EAs)
         mt5_positions = mt5.positions_get(symbol=resolved_filter) if resolved_filter else mt5.positions_get()
         if mt5_positions:
             for pos in mt5_positions:
+                pos_magic = getattr(pos, "magic", None)
+                if pos_magic is not None and int(pos_magic) not in (0, DEMO_MAGIC_NUMBER):
+                    # Do not auto-close or modify positions managed by external MQL5 EAs (e.g. XAUUSD_M1_BreakoutStops)
+                    continue
                 pos_sym = str(pos.symbol)
                 info = mt5.symbol_info(pos_sym)
                 tick = mt5.symbol_info_tick(pos_sym)
@@ -2087,7 +2114,7 @@ def _inprocess_close_demo_positions(
         mt5.shutdown()
 
 
-def _inprocess_trade_history(days: int = 30, limit: int = 150) -> dict[str, Any]:
+def _inprocess_trade_history(days: int = 120, limit: int = 300) -> dict[str, Any]:
     """Fetch closed trades from MT5 (`history_deals_get`) + closed Demo Overlay trades and compute stats."""
     import MetaTrader5 as mt5
 
@@ -2138,6 +2165,9 @@ def _inprocess_trade_history(days: int = 30, limit: int = 150) -> dict[str, Any]
                         "time": datetime.fromtimestamp(int(getattr(d, "time", 0)), timezone.utc).isoformat(),
                         "side": "BUY" if d_type == deal_type_buy else "SELL",
                         "volume": float(getattr(d, "volume", 0.01)),
+                        "comment": str(getattr(d, "comment", "") or ""),
+                        "magic": int(getattr(d, "magic", 0) or 0),
+                        "commission_in": float(getattr(d, "commission", 0.0)),
                     }
 
             for d in deals:
@@ -2164,8 +2194,13 @@ def _inprocess_trade_history(days: int = 30, limit: int = 150) -> dict[str, Any]
                     float(getattr(d, "profit", 0.0))
                     + float(getattr(d, "swap", 0.0))
                     + float(getattr(d, "commission", 0.0))
+                    + float(entry_meta.get("commission_in", 0.0))
                     + float(getattr(d, "fee", 0.0))
                 )
+                in_comment = str(entry_meta.get("comment") or "")
+                out_comment = str(getattr(d, "comment", "") or "")
+                magic_num = int(entry_meta.get("magic") or getattr(d, "magic", 0) or 0)
+                bot_label = _resolve_position_bot_label(in_comment or out_comment, magic_num)
                 seen_tickets.add(deal_ticket)
                 seen_tickets.add(pos_id)
                 closed_trades.append(
@@ -2181,7 +2216,10 @@ def _inprocess_trade_history(days: int = 30, limit: int = 150) -> dict[str, Any]
                         "close_time": close_iso,
                         "realized_pnl": round(realized, 2),
                         "digits": digits,
-                        "comment": str(getattr(d, "comment", "") or ""),
+                        "magic": magic_num,
+                        "comment": in_comment or out_comment,
+                        "exit_comment": out_comment,
+                        "bot_label": bot_label,
                         "source": "mt5_terminal",
                     }
                 )
@@ -2319,7 +2357,7 @@ def get_mt5_open_positions(symbol: str | None = None) -> dict[str, Any]:
             }
 
 
-def get_mt5_trade_history(days: int = 30, limit: int = 150) -> dict[str, Any]:
+def get_mt5_trade_history(days: int = 120, limit: int = 300) -> dict[str, Any]:
     try:
         import MetaTrader5  # noqa: F401
 

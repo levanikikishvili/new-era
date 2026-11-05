@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from .ai_providers import AIProviderRouter
 from .config import ROOT, load_workspace_dotenv
 from .controls import DEFAULT_RUNTIME_CONTROLS, RuntimeControls
 
@@ -526,9 +527,10 @@ class GeminiPortfolioManager:
 
     def __init__(self, root: Path = ROOT) -> None:
         self.root = root
+        self.provider_router = AIProviderRouter(root=root)
         self.autonomous_mode: bool = False
         self.dynamic_trailing_enabled: bool = True
-        # Fail-safe: in autonomous mode every trade must be APPROVED by the live Gemini API.
+        # Fail-safe: in autonomous mode every trade must be APPROVED by the live External AI CIO gate.
         self.gemini_review_required: bool = True
         self._last_decision: dict[str, Any] | None = None
         self._chat_history: list[dict[str, str]] = []
@@ -541,7 +543,8 @@ class GeminiPortfolioManager:
     def _get_api_key(self) -> str:
         load_workspace_dotenv(self.root)
         return (
-            os.getenv("GEMINI_API_KEY", "").strip()
+            os.getenv("OPENAI_API_KEY", "").strip()
+            or os.getenv("GEMINI_API_KEY", "").strip()
             or os.getenv("GOOGLE_API_KEY", "").strip()
         )
 
@@ -560,6 +563,7 @@ class GeminiPortfolioManager:
 
     def gemini_status(self) -> dict[str, Any]:
         """Cheap (no network) status snapshot for /health and the UI header."""
+        router_snap = self.provider_router.status_snapshot()
         return {
             "configured": self.is_configured,
             "live": bool(self.active_model and self.last_gemini_ok_at),
@@ -568,6 +572,9 @@ class GeminiPortfolioManager:
             "last_error": self.last_gemini_error,
             "review_required": self.gemini_review_required,
             "last_cio_review": self.last_cio_review,
+            "primary_provider": router_snap.get("primary_provider", "openai"),
+            "effective_provider": router_snap.get("effective_provider", "deterministic_quant_fallback"),
+            "providers": router_snap.get("providers", {}),
         }
 
     def ping_gemini(self, timeout: float = 15.0) -> dict[str, Any]:
@@ -1428,6 +1435,13 @@ class GeminiPortfolioManager:
                 f"🛑 ჯოი (Gemini Quant CIO): კვლევის მტკიცებულება არასაკმარისი ან არავალიდურია "
                 f"({'; '.join(evidence_reasons[:3])}). საბოლოო გადაწყვეტილება: ABSTAIN."
             )
+        elif sizing.get("risk_constraint_status") == "ABSTAIN_MIN_LOT_EXCEEDS_RISK_CAP":
+            rationale_ka = (
+                f"🛑 ჯოი (Gemini Quant CIO): სიგნალის Win-Probability ({win_prob_pct:.1f}%) აკმაყოფილებს ზღვარს, "
+                f"მაგრამ მინიმალური ბროკერული ლოტი (0.01) აჭარბებს მიმდინარე რისკის ბიუჯეტს "
+                f"(${sizing['risk_usd']:.2f} / {sizing['risk_pct']:.2f}% Equity, SL მანძილი={sizing.get('sl_distance', 0.0):.2f}). "
+                f"საბოლოო გადაწყვეტილება: ABSTAIN (ABSTAIN_MIN_LOT_EXCEEDS_RISK_CAP)."
+            )
         else:
             rationale_ka = (
                 f"⏳ ჯოი (Gemini Quant CIO): მიმდინარე Win-Probability ({win_prob_pct:.1f}%) ნაკლებია 65%-იან ზღვარზე "
@@ -1505,10 +1519,31 @@ class GeminiPortfolioManager:
         max_tokens: int = 4096,
         temperature: float = 0.25,
     ) -> str | None:
-        """Call the Gemini REST API, falling through working models. Returns None on any failure."""
-        api_key = self._get_api_key()
+        """Call the configured External AI Provider (OpenAI primary or Gemini fallback). Returns None on failure."""
+        load_workspace_dotenv(self.root)
+        if self.provider_router.openai.is_enabled and self.provider_router.openai.is_configured:
+            oa_resp = self.provider_router.openai.generate(
+                system_instruction,
+                user_prompt,
+                json_mode=json_mode,
+                temperature=temperature,
+                max_tokens=min(max_tokens, 2048),
+                timeout=timeout,
+            )
+            if oa_resp.ok and oa_resp.text:
+                self.active_model = f"openai/{oa_resp.model}"
+                self.last_gemini_ok_at = oa_resp.timestamp
+                self.last_gemini_error = ""
+                return oa_resp.text
+            self.last_gemini_error = oa_resp.error
+
+        api_key = (
+            os.getenv("GEMINI_API_KEY", "").strip()
+            or os.getenv("GOOGLE_API_KEY", "").strip()
+            or self._get_api_key()
+        )
         if not api_key or api_key.startswith("your_"):
-            self.last_gemini_error = "GEMINI_API_KEY not configured"
+            self.last_gemini_error = self.last_gemini_error or "GEMINI_API_KEY not configured"
             return None
 
         gen_cfg: dict[str, Any] = {"temperature": temperature, "maxOutputTokens": max_tokens}

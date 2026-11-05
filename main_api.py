@@ -577,6 +577,158 @@ async def memory_search(
     return MemorySearchResponse(query=q, results=results)
 
 
+# ---------------------------------------------------------------------------
+# New Era 2.0 — Signal Intelligence, Execution Monitor, Analytics, Providers & SaaS
+# ---------------------------------------------------------------------------
+@app.get("/intelligence/signals")
+async def intelligence_signals(
+    search: str = Query(default="", max_length=200),
+    symbol: str = Query(default=""),
+    strategy: str = Query(default=""),
+    direction: str = Query(default=""),
+    lifecycle_status: str = Query(default=""),
+    blocking_category: str = Query(default=""),
+    blocking_agent: str = Query(default=""),
+    date_from: str = Query(default=""),
+    date_to: str = Query(default=""),
+    limit: int = Query(default=250, ge=1, le=2000),
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        orchestrator.historical_intelligence.query_signals,
+        search=search,
+        symbol=symbol,
+        strategy=strategy,
+        direction=direction,
+        lifecycle_status=lifecycle_status,
+        blocking_category=blocking_category,
+        blocking_agent=blocking_agent,
+        date_from=date_from,
+        date_to=date_to,
+        limit=limit,
+    )
+
+
+@app.get("/intelligence/signals/export")
+async def intelligence_signals_export(
+    fmt: str = Query(default="csv"),
+    search: str = Query(default=""),
+    symbol: str = Query(default=""),
+    lifecycle_status: str = Query(default=""),
+    limit: int = Query(default=500, ge=1, le=2000),
+) -> dict[str, Any]:
+    queried = await asyncio.to_thread(
+        orchestrator.historical_intelligence.query_signals,
+        search=search,
+        symbol=symbol,
+        lifecycle_status=lifecycle_status,
+        limit=limit,
+    )
+    exported = orchestrator.historical_intelligence.export_signals(queried["signals"], fmt=fmt)
+    return {
+        "format": fmt.lower(),
+        "count": len(queried["signals"]),
+        "content": exported,
+    }
+
+
+@app.get("/intelligence/signals/{signal_id}")
+async def intelligence_signal_inspector(signal_id: str) -> dict[str, Any]:
+    return await asyncio.to_thread(orchestrator.historical_intelligence.get_signal_inspector, signal_id)
+
+
+@app.get("/intelligence/why-no-trade")
+async def intelligence_why_no_trade() -> dict[str, Any]:
+    gates = orchestrator.latest_gates()
+    return await asyncio.to_thread(orchestrator.historical_intelligence.build_why_no_trade_diagnostics, gates)
+
+
+@app.get("/intelligence/council")
+async def intelligence_ai_council() -> dict[str, Any]:
+    gates = orchestrator.latest_gates()
+    return await asyncio.to_thread(orchestrator.historical_intelligence.build_ai_council_view, gates)
+
+
+@app.get("/execution/pipeline")
+async def execution_pipeline_status() -> dict[str, Any]:
+    gates = orchestrator.latest_gates()
+    mt5_st = await asyncio.to_thread(get_mt5_status, 15)
+    combined = {**gates, "mt5": mt5_st}
+    return await asyncio.to_thread(orchestrator.historical_intelligence.build_execution_pipeline, combined)
+
+
+@app.get("/analytics/performance")
+async def analytics_performance(days: int = Query(default=30, ge=1, le=365)) -> dict[str, Any]:
+    hist = await orchestrator.get_trade_history(days=days, limit=500)
+    trades = hist.get("trades") if isinstance(hist, dict) else None
+    return await asyncio.to_thread(orchestrator.historical_intelligence.build_performance_analytics, trades)
+
+
+@app.get("/intelligence/bot-performance")
+async def intelligence_bot_performance(refresh_live_positions: bool = Query(default=True)) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        orchestrator.bot_intelligence.build_full_intelligence_report,
+        refresh_live_positions=refresh_live_positions,
+    )
+
+
+@app.get("/intelligence/bot-performance/export")
+async def intelligence_bot_performance_export(fmt: str = Query(default="json")) -> dict[str, Any]:
+    report = await asyncio.to_thread(
+        orchestrator.bot_intelligence.build_full_intelligence_report,
+        refresh_live_positions=False,
+    )
+    if fmt.lower() == "csv":
+        content = await asyncio.to_thread(orchestrator.bot_intelligence.export_trades_csv, report.get("closed_trades"))
+        return {"ok": True, "format": "csv", "count": len(report.get("closed_trades") or []), "content": content}
+    return {
+        "ok": True,
+        "format": "json",
+        "count": len(report.get("closed_trades") or []),
+        "content": json.dumps(report, indent=2, ensure_ascii=False),
+    }
+
+
+@app.get("/logs/unified")
+async def logs_unified(
+    category: str = Query(default="ALL"),
+    search: str = Query(default=""),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> dict[str, Any]:
+    ev_hist = list(getattr(bus, "_history", []))
+    return await asyncio.to_thread(
+        orchestrator.historical_intelligence.build_unified_logs,
+        category=category,
+        search=search,
+        limit=limit,
+        event_history=ev_hist,
+    )
+
+
+@app.get("/providers/status")
+async def providers_status() -> dict[str, Any]:
+    return orchestrator.gemini_cio.provider_router.status_snapshot()
+
+
+@app.post("/providers/config")
+async def providers_config(payload: dict[str, Any]) -> dict[str, Any]:
+    return orchestrator.gemini_cio.provider_router.configure(payload)
+
+
+@app.get("/saas/architecture")
+async def saas_architecture() -> dict[str, Any]:
+    return orchestrator.saas.architecture_overview()
+
+
+@app.get("/saas/session")
+async def saas_session() -> dict[str, Any]:
+    return {
+        "authenticated": True,
+        "mode": "local_demo_operator",
+        "environment": "DEMO_ONLY",
+        "operator": orchestrator.saas.current_operator().to_public_dict(),
+    }
+
+
 @app.websocket("/ws/logs")
 async def websocket_logs(websocket: WebSocket) -> None:
     await websocket.accept()

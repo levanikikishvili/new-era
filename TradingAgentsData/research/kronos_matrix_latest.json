@@ -1,10 +1,10 @@
 {
-  "generated_epoch": 1793124464,
-  "expires_epoch": 1793129864,
+  "generated_epoch": 1793781007,
+  "expires_epoch": 1793786407,
   "strategy": "new-era-kronos-matrix-v1",
   "symbol": "XAUUSD",
   "data_source": "/workspace/TradingAgentsData/market/xauusd_m5.csv",
-  "last_bar": "2026-10-27 14:00:00+00:00",
+  "last_bar": "2026-11-04 10:20:00+00:00",
   "model": "NeoQuasar/Kronos-small",
   "tokenizer": "NeoQuasar/Kronos-Tokenizer-base",
   "device": "cpu",
@@ -13,67 +13,67 @@
   "execution_allowed": false,
   "real_account_allowed": false,
   "action": "ABSTAIN",
-  "score": 4.25,
-  "confidence": 0.5875,
+  "score": 5.5,
+  "confidence": 0.7,
   "confidence_note": "heuristic confluence score, not a calibrated probability",
   "decision": {
     "strategy": "new-era-kronos-matrix-v1",
     "action": "ABSTAIN",
-    "score": 4.25,
-    "confidence": 0.5875,
+    "score": 5.5,
+    "confidence": 0.7,
     "reasons": [
-      "H4: trend aligned bearish",
-      "H1: trend is mixed",
+      "H4: trend is mixed",
+      "H1: trend aligned bullish",
       "M15: momentum aligned bullish",
       "M5: no closed-bar range breakout",
       "nearest analogs: 8",
-      "positive/negative rates: 0.38/0.62",
-      "forecast move=0.94 ATR",
+      "positive/negative rates: 0.75/0.25",
+      "forecast move=-2.53 ATR",
       "path agreement=1.00"
     ],
     "matrix": {
       "direction": "ABSTAIN",
-      "score": 2.0,
-      "buy_score": 1.0,
-      "sell_score": 2.0,
+      "score": 3.0,
+      "buy_score": 3.0,
+      "sell_score": 0.0,
       "reasons": [
-        "H4: trend aligned bearish",
-        "H1: trend is mixed",
+        "H4: trend is mixed",
+        "H1: trend aligned bullish",
         "M15: momentum aligned bullish",
         "M5: no closed-bar range breakout"
       ],
       "metrics": {
-        "m15_ema": 4001.964157348312,
-        "m15_rsi": 54.94166850099036,
-        "m5_close": 4011.89,
-        "m5_atr": 5.190714285714226,
-        "m5_range_high": 4016.31,
-        "m5_range_low": 3993.3,
-        "m5_breakout_distance_atr": -0.8515205724508288,
-        "m5_breakdown_distance_atr": -3.581395348837191
+        "m15_ema": 3993.9346774031333,
+        "m15_rsi": 87.6666379977637,
+        "m5_close": 4032.68,
+        "m5_atr": 5.031428571428478,
+        "m5_range_high": 4038.6,
+        "m5_range_low": 4014.55,
+        "m5_breakout_distance_atr": -1.1766042021579013,
+        "m5_breakdown_distance_atr": -3.6033503691084596
       }
     },
     "analog": {
-      "direction": "SELL",
+      "direction": "BUY",
       "sample_count": 8,
-      "win_rate": 0.625,
-      "median_forward_return": -0.0005400441908771092,
-      "p25_forward_return": -0.0011261507245953206,
-      "p75_forward_return": 0.00043019276502764825,
-      "median_distance": 0.8738961920974857,
+      "win_rate": 0.75,
+      "median_forward_return": 0.0013897928364576817,
+      "p25_forward_return": -0.0012189835736573507,
+      "p75_forward_return": 0.0016040446289886656,
+      "median_distance": 0.8819139545111786,
       "reasons": [
         "nearest analogs: 8",
-        "positive/negative rates: 0.38/0.62"
+        "positive/negative rates: 0.75/0.25"
       ]
     },
     "forecast": {
-      "direction": "BUY",
-      "move_atr": 0.9366165650371895,
-      "final_return": 0.0012118250959960442,
+      "direction": "SELL",
+      "move_atr": -2.528553500763075,
+      "final_return": -0.0031547844927256596,
       "path_agreement": 1.0,
       "forecast_bars": 12,
       "reasons": [
-        "forecast move=0.94 ATR",
+        "forecast move=-2.53 ATR",
         "path agreement=1.00"
       ]
     },

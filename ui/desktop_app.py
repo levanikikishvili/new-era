@@ -26,6 +26,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+# When this file is launched directly by the PowerShell desktop launcher,
+# Python places ``ui`` (rather than the workspace root) at sys.path[0].  Add
+# the root before importing shared backend/UI modules.
+WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
+if str(WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_ROOT))
+
 from PyQt6.QtCore import QObject, QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QTextCursor
 from PyQt6.QtWidgets import (
@@ -57,6 +64,7 @@ from PyQt6.QtWidgets import (
 )
 
 from newera_api.gui import BotStrategyLabPanel, Phase2WorkspaceTabs
+from newera_api.ui_v2 import NewEra2WorkspaceShell
 
 try:
     from PyQt6.QtWebEngineCore import QWebEngineSettings
@@ -80,9 +88,6 @@ DEFAULT_HOST = os.getenv("NEWERA_API_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.getenv("NEWERA_API_PORT", "8787"))
 DEFAULT_API_URL = f"http://{DEFAULT_HOST}:{DEFAULT_PORT}"
 DEFAULT_WS_URL = f"ws://{DEFAULT_HOST}:{DEFAULT_PORT}/ws/logs"
-WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
-
-
 # ---------------------------------------------------------------------------
 # Trading Sessions & Killzones Calculator (UTC)
 # ---------------------------------------------------------------------------
@@ -1044,7 +1049,7 @@ class NewEraDesktopTerminal(QMainWindow):
         }
         self._workspace_settings = QSettings("NewEra", "NewEraTradingBot")
         self.workspace_settings = self._workspace_settings
-        self._workspace_layout_version = 3
+        self._workspace_layout_version = 4
         self._ws_connected = False
         self._ws_status_text = "WS CONNECTING"
         self._ws_ping_ms: float | None = None
@@ -1053,7 +1058,7 @@ class NewEraDesktopTerminal(QMainWindow):
         self._active_bot_count = 0
 
         self.setWindowTitle(
-            "New Era Trading Bot — Enterprise AI Quant Platform [8-Pair Auto-Screener • MT5 L2 DOM • TradingView • Kronos • Gemini CIO]"
+            "NEW ERA 2.0 — Institutional AI Trading Terminal [DEMO ONLY • XAUUSD • AI Council • Execution Intelligence]"
         )
         self.resize(1680, 980)
         self.setMinimumSize(1280, 780)
@@ -1108,27 +1113,25 @@ class NewEraDesktopTerminal(QMainWindow):
         phase2_widgets = self.phase2_tabs.detach_tabs_for_docks()
         self._build_phase3_docks(phase2_widgets)
 
-        workspace_canvas = QFrame(central)
-        workspace_canvas.setObjectName("CardPanel")
-        canvas_layout = QVBoxLayout(workspace_canvas)
-        canvas_layout.setContentsMargins(18, 18, 18, 18)
-        canvas_layout.setSpacing(8)
-        canvas_title = QLabel("NATIVE QUANT WORKSPACE")
-        canvas_title.setObjectName("SectionHeader")
-        canvas_copy = QLabel(
-            "Phase 3 panels are dockable, floatable, movable, and closable. "
-            "Use View to restore a hidden panel or Bot Lab to open Strategy Lab."
+        # New Era 2.0 Unified Single-Window Workspace Shell (Collapsible Left Sidebar + 13 Main Sections)
+        self.workspace_shell = NewEra2WorkspaceShell(
+            root=WORKSPACE_ROOT,
+            trading_terminal_widget=phase2_widgets[0],
+            strategy_lab_widget=self.strategy_lab_panel,
+            quant_controls_widget=phase2_widgets[1],
+            bot_fleet_widget=phase2_widgets[2],
+            decision_audit_widget=phase2_widgets[3],
+            parent=central,
         )
-        canvas_copy.setWordWrap(True)
-        canvas_copy.setObjectName("Phase3WorkspaceHint")
-        canvas_layout.addWidget(canvas_title)
-        canvas_layout.addWidget(canvas_copy)
-        canvas_layout.addStretch(1)
-        root_layout.addWidget(workspace_canvas, stretch=1)
+        self.workspace_shell.refresh_requested.connect(self.refresh_all_state)
+        root_layout.addWidget(self.workspace_shell, stretch=1)
 
         self._build_status_bar()
         self._build_phase3_menus()
         self._restore_workspace_layout()
+        # Keep perimeter docks hidden by default in the New Era 2.0 Single-Workspace Shell
+        for dock in self.phase3_docks.values():
+            dock.hide()
 
     def _build_status_bar(self) -> None:
         status_bar = QStatusBar(self)
@@ -1404,26 +1407,31 @@ class NewEraDesktopTerminal(QMainWindow):
 
     def _insert_phase3_placeholder(self, label: str) -> None:
         self.strategy_lab_panel.insert_placeholder(label)
-        self._show_dock(self.strategy_lab_dock)
+        if hasattr(self, "workspace_shell"):
+            self.workspace_shell.navigate_to("strategy_lab")
 
     def _show_dock(self, dock: QDockWidget) -> None:
         dock.show()
         dock.raise_()
 
     def show_strategy_lab(self) -> None:
-        self._show_dock(self.strategy_lab_dock)
+        if hasattr(self, "workspace_shell"):
+            self.workspace_shell.navigate_to("strategy_lab")
         self.strategy_lab_panel.open_strategy_lab()
 
     def show_strategy_backtester(self) -> None:
-        self._show_dock(self.strategy_lab_dock)
+        if hasattr(self, "workspace_shell"):
+            self.workspace_shell.navigate_to("strategy_lab")
         self.strategy_lab_panel.open_backtester()
 
     def show_manual_risk_override(self) -> None:
-        self._show_dock(self.strategy_lab_dock)
+        if hasattr(self, "workspace_shell"):
+            self.workspace_shell.navigate_to("strategy_lab")
         self.strategy_lab_panel.open_manual_risk_override()
 
     def show_github_quant_module_search(self) -> None:
-        self._show_dock(self.strategy_lab_dock)
+        if hasattr(self, "workspace_shell"):
+            self.workspace_shell.navigate_to("strategy_lab")
         self.strategy_lab_panel.open_github_module_search()
 
     @staticmethod
@@ -2070,7 +2078,21 @@ class NewEraDesktopTerminal(QMainWindow):
         chart_container = QWidget(chart_splitter)
         chart_vbox = QVBoxLayout(chart_container)
         chart_vbox.setContentsMargins(0, 0, 0, 0)
-        chart_vbox.setSpacing(0)
+        chart_vbox.setSpacing(2)
+
+        # Live Chart Open Position Overlay Banner (shows ALL active MT5 positions on account — Manual, External EAs & NewEra)
+        self.chart_live_position_banner = QLabel(
+            "📊 LIVE MT5 ACCOUNT POSITIONS ON CHART: None currently open",
+            chart_container,
+        )
+        self.chart_live_position_banner.setObjectName("ChartLivePositionBanner")
+        self.chart_live_position_banner.setWordWrap(True)
+        self.chart_live_position_banner.setStyleSheet(
+            "background-color: #0f172a; color: #38bdf8; border: 1px solid #1e293b; "
+            "border-radius: 4px; padding: 5px 10px; font-family: 'Consolas', monospace; "
+            "font-size: 11px; font-weight: bold;"
+        )
+        chart_vbox.addWidget(self.chart_live_position_banner)
 
         if QWebEngineView is not None and os.environ.get("QT_QPA_PLATFORM") != "offscreen":
             self.web_chart: QWebEngineView | None = QWebEngineView(chart_container)
@@ -2135,7 +2157,7 @@ class NewEraDesktopTerminal(QMainWindow):
         open_hdr.addWidget(btn_close_all_pos)
         open_layout.addLayout(open_hdr)
 
-        self.open_positions_table = QTableWidget(0, 10, open_tab)
+        self.open_positions_table = QTableWidget(0, 11, open_tab)
         self.open_positions_table.setAlternatingRowColors(True)
         self.open_positions_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.open_positions_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -2152,6 +2174,7 @@ class NewEraDesktopTerminal(QMainWindow):
                 "TP",
                 "Live PnL ($ / %)",
                 "Close",
+                "Bot / Strategy (Magic)",
             ]
         )
         open_h = self.open_positions_table.horizontalHeader()
@@ -2200,7 +2223,7 @@ class NewEraDesktopTerminal(QMainWindow):
         stats_row.addWidget(self.btn_refresh_history)
         hist_layout.addWidget(stats_bar)
 
-        self.trade_history_table = QTableWidget(0, 7, hist_tab)
+        self.trade_history_table = QTableWidget(0, 8, hist_tab)
         self.trade_history_table.setAlternatingRowColors(True)
         self.trade_history_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.trade_history_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -2214,6 +2237,7 @@ class NewEraDesktopTerminal(QMainWindow):
                 "Volume",
                 "Entry → Exit Price",
                 "Realized Profit/Loss ($)",
+                "Bot / Strategy (Magic)",
             ]
         )
         hist_h = self.trade_history_table.horizontalHeader()
@@ -3452,7 +3476,7 @@ class NewEraDesktopTerminal(QMainWindow):
         self._spawn_http_task(
             "mt5_history",
             "GET",
-            "/mt5/history?days=30&limit=150",
+            "/mt5/history?days=120&limit=300",
             timeout=10.0,
         )
 
@@ -3720,6 +3744,7 @@ class NewEraDesktopTerminal(QMainWindow):
         self.bottom_positions_tabs.setTabText(0, f"📊 ACTIVE OPEN POSITIONS ({count})")
 
         self.open_positions_table.setRowCount(count)
+        banner_lines: list[str] = []
         for row_idx, pos in enumerate(self._open_positions):
             ticket = int(pos.get("ticket") or 0)
             sym = str(pos.get("symbol") or "XAUUSD")
@@ -3731,6 +3756,7 @@ class NewEraDesktopTerminal(QMainWindow):
             sl_px = float(pos.get("sl") or 0.0)
             tp_px = float(pos.get("tp") or 0.0)
             pnl = float(pos.get("profit") or 0.0)
+            bot_lbl = str(pos.get("bot_label") or pos.get("comment") or "Manual / External")
             pos_pct = (
                 float(pos["pnl_pct"])
                 if pos.get("pnl_pct") is not None
@@ -3740,6 +3766,12 @@ class NewEraDesktopTerminal(QMainWindow):
             p_sign = "+" if pnl >= 0 else "-"
             pp_sign = "+" if pos_pct >= 0 else "-"
             pnl_str = f"{p_sign}${abs(pnl):.2f} ({pp_sign}{abs(pos_pct):.2f}%)"
+            sl_str = f"{sl_px:.{digits}f}" if sl_px > 0 else "--"
+            tp_str = f"{tp_px:.{digits}f}" if tp_px > 0 else "--"
+            banner_lines.append(
+                f"[#{ticket} {sym} {side} {vol:.2f} Lot @ {open_px:.{digits}f} → {cur_px:.{digits}f} | "
+                f"SL: {sl_str} | TP: {tp_str} | Bot: {bot_lbl} | P/L: {pnl_str}]"
+            )
 
             cells = [
                 QTableWidgetItem(f"#{ticket}"),
@@ -3748,8 +3780,8 @@ class NewEraDesktopTerminal(QMainWindow):
                 QTableWidgetItem(f"{vol:.2f}"),
                 QTableWidgetItem(f"{open_px:.{digits}f}"),
                 QTableWidgetItem(f"{cur_px:.{digits}f}"),
-                QTableWidgetItem(f"{sl_px:.{digits}f}" if sl_px > 0 else "--"),
-                QTableWidgetItem(f"{tp_px:.{digits}f}" if tp_px > 0 else "--"),
+                QTableWidgetItem(sl_str),
+                QTableWidgetItem(tp_str),
                 QTableWidgetItem(pnl_str),
             ]
             cells[2].setForeground(QColor("#10b981" if side == "BUY" else "#ef4444"))
@@ -3765,10 +3797,41 @@ class NewEraDesktopTerminal(QMainWindow):
             close_btn.clicked.connect(lambda checked=False, t=ticket: self.trigger_close_single_position(t))
             self.open_positions_table.setCellWidget(row_idx, 9, close_btn)
 
+            bot_item = QTableWidgetItem(bot_lbl)
+            bot_item.setForeground(QColor("#38bdf8"))
+            bot_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.open_positions_table.setItem(row_idx, 10, bot_item)
+
+        if hasattr(self, "chart_live_position_banner"):
+            if banner_lines:
+                b_color = "#10b981" if total_pnl >= 0 else "#f59e0b"
+                self.chart_live_position_banner.setText(
+                    f"⚡ LIVE OPEN MT5 POSITION(S) ({count}):  " + "   •   ".join(banner_lines)
+                )
+                self.chart_live_position_banner.setStyleSheet(
+                    f"background-color: #111827; color: {b_color}; border: 1px solid {b_color}; "
+                    "border-radius: 4px; padding: 6px 10px; font-family: 'Consolas', monospace; "
+                    "font-size: 11px; font-weight: bold;"
+                )
+            else:
+                self.chart_live_position_banner.setText(
+                    "📊 LIVE MT5 ACCOUNT POSITIONS ON CHART: 0 open positions right now (All manual & EA trades appear here automatically)"
+                )
+                self.chart_live_position_banner.setStyleSheet(
+                    "background-color: #0f172a; color: #94a3b8; border: 1px solid #1e293b; "
+                    "border-radius: 4px; padding: 5px 10px; font-family: 'Consolas', monospace; "
+                    "font-size: 11px; font-weight: bold;"
+                )
+
+        if hasattr(self, "workspace_shell"):
+            self.workspace_shell.update_positions_and_history(open_positions=self._open_positions)
+
     def _update_trade_history_ui(self, data: dict[str, Any]) -> None:
         if not isinstance(data, dict):
             return
         trades = data.get("trades") if isinstance(data.get("trades"), list) else []
+        if hasattr(self, "workspace_shell"):
+            self.workspace_shell.update_positions_and_history(closed_trades=trades)
         summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
 
         total_realized = float(summary.get("total_realized_pnl") or 0.0)
@@ -3805,6 +3868,7 @@ class NewEraDesktopTerminal(QMainWindow):
             entry_p = float(tr.get("entry_price") or 0.0)
             exit_p = float(tr.get("exit_price") or 0.0)
             net_pnl = float(tr.get("realized_pnl") if tr.get("realized_pnl") is not None else (tr.get("profit") or 0.0))
+            bot_lbl = str(tr.get("bot_label") or tr.get("comment") or "MT5 Deal")
 
             n_sign = "+" if net_pnl >= 0 else "-"
             items = [
@@ -3815,9 +3879,11 @@ class NewEraDesktopTerminal(QMainWindow):
                 QTableWidgetItem(f"{vol:.2f}"),
                 QTableWidgetItem(f"{entry_p:.2f} → {exit_p:.2f}"),
                 QTableWidgetItem(f"{n_sign}${abs(net_pnl):.2f}"),
+                QTableWidgetItem(bot_lbl),
             ]
             items[3].setForeground(QColor("#10b981" if side == "BUY" else "#ef4444"))
             items[6].setForeground(QColor("#10b981" if net_pnl >= 0 else "#ef4444"))
+            items[7].setForeground(QColor("#38bdf8"))
             for col_idx, cell_item in enumerate(items):
                 cell_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.trade_history_table.setItem(row_idx, col_idx, cell_item)
@@ -4325,6 +4391,8 @@ class NewEraDesktopTerminal(QMainWindow):
 
 
     def _update_mt5_status_ui(self, data: dict[str, Any]) -> None:
+        if hasattr(self, "workspace_shell"):
+            self.workspace_shell.update_mt5_telemetry(data)
         connected = bool(data.get("connected", False))
         acc = data.get("account") if isinstance(data.get("account"), dict) else None
         if connected and acc is not None:
@@ -4743,6 +4811,8 @@ class NewEraDesktopTerminal(QMainWindow):
             self.phase2_fleet_tab.set_status(data)
 
     def _update_gates_and_prediction_ui(self, data: dict[str, Any]) -> None:
+        if hasattr(self, "workspace_shell"):
+            self.workspace_shell.update_gates_and_council(data)
         active_symbol = self.ticker_combo.currentText().strip().upper() or "XAUUSD"
 
         def active_payload(value: object) -> dict[str, Any]:
@@ -5562,15 +5632,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def create_main_window(app: QApplication, api_url: str = DEFAULT_API_URL, ws_url: str = DEFAULT_WS_URL, *, smoke_test: bool = False) -> "NewEraDesktopTerminal":
+    """Build and show the main terminal window (shared by `main()` and the desktop launcher)."""
+    app.setApplicationName("New Era AI Quant Platform")
+    _icon_path = WORKSPACE_ROOT / "assets" / "newera.ico"
+    if _icon_path.is_file():
+        from PyQt6.QtGui import QIcon
+
+        app.setWindowIcon(QIcon(str(_icon_path)))
+    window = NewEraDesktopTerminal(api_url=api_url, ws_url=ws_url)
+    window.show()
+
+    if not smoke_test and hasattr(window, "workspace_shell") and hasattr(
+        window.workspace_shell, "_refresh_fleet_command_center_ui"
+    ):
+        # The 7-bot fleet worker runs ONLY inside the FastAPI backend process (single executor,
+        # no duplicate orders). The UI just re-reads the shared fleet state file periodically.
+        fleet_timer = QTimer(window)
+        fleet_timer.setInterval(8000)
+        fleet_timer.timeout.connect(window.workspace_shell._refresh_fleet_command_center_ui)
+        fleet_timer.start()
+        window._fleet_ui_timer = fleet_timer
+    return window
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.smoke_test and "QT_QPA_PLATFORM" not in os.environ:
         os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-    app = QApplication(sys.argv if argv is None else [sys.argv[0], *argv])
-    app.setApplicationName("New Era AI Quant Platform")
-    window = NewEraDesktopTerminal(api_url=args.api_url, ws_url=args.ws_url)
-    window.show()
+    app = QApplication.instance() or QApplication(sys.argv if argv is None else [sys.argv[0], *argv])
+    window = create_main_window(app, args.api_url, args.ws_url, smoke_test=args.smoke_test)
 
     if args.smoke_test:
         QTimer.singleShot(1500, window.close)

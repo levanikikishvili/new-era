@@ -272,3 +272,6 @@ No Docker build or deployment step should receive credentials through a
 The detailed Georgian MT5, TradingView, TradingAgents, and Kronos operating
 notes remain in [`README_GE.md`](README_GE.md). This reproducibility layer does
 not change trading logic or delete existing research/data files.
+
+The MT5 execution audit, current root-cause evidence, EA update steps, and safe
+DEMO verification plan are documented in [`MT5_EXECUTION_AUDIT.md`](MT5_EXECUTION_AUDIT.md).

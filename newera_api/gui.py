@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QTableWidget,
@@ -893,57 +894,67 @@ class BotStrategyLabPanel(QWidget):
         self.lab_tabs = QTabWidget(self)
         self.strategy_lab_tabs = self.lab_tabs
 
-        strategy_tab = QWidget(self.lab_tabs)
+        strategy_scroll = QScrollArea(self.lab_tabs)
+        strategy_scroll.setWidgetResizable(True)
+        strategy_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        strategy_tab = QWidget(strategy_scroll)
         strategy_layout = QVBoxLayout(strategy_tab)
-        strategy_layout.setContentsMargins(8, 8, 8, 8)
-        strategy_layout.setSpacing(8)
+        strategy_layout.setContentsMargins(10, 10, 10, 10)
+        strategy_layout.setSpacing(10)
 
         config_card = QFrame(strategy_tab)
         config_card.setObjectName("SubCard")
         config_grid = QGridLayout(config_card)
-        config_grid.setContentsMargins(10, 8, 10, 8)
-        config_grid.setHorizontalSpacing(10)
-        config_grid.setVerticalSpacing(8)
+        config_grid.setContentsMargins(12, 10, 12, 10)
+        config_grid.setHorizontalSpacing(12)
+        config_grid.setVerticalSpacing(10)
 
         config_grid.addWidget(QLabel("Strategy name:"), 0, 0)
         self.strategy_name_input = QLineEdit(config_card)
         self.strategy_name_input.setObjectName("StrategyNameInput")
+        self.strategy_name_input.setMinimumHeight(30)
         self.strategy_name_input.setText("New Era Confluence Preview")
-        config_grid.addWidget(self.strategy_name_input, 0, 1, 1, 2)
+        config_grid.addWidget(self.strategy_name_input, 0, 1, 1, 3)
 
         config_grid.addWidget(QLabel("Symbol:"), 1, 0)
         self.strategy_symbol_combo = QComboBox(config_card)
         self.strategy_symbol_combo.setObjectName("StrategySymbolSelector")
+        self.strategy_symbol_combo.setMinimumHeight(30)
         self.strategy_symbol_combo.addItems(["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "BTCUSD", "US500", "USTEC"])
         config_grid.addWidget(self.strategy_symbol_combo, 1, 1)
 
         config_grid.addWidget(QLabel("Timeframe:"), 1, 2)
         self.strategy_timeframe_combo = QComboBox(config_card)
         self.strategy_timeframe_combo.setObjectName("StrategyTimeframeSelector")
+        self.strategy_timeframe_combo.setMinimumHeight(30)
         self.strategy_timeframe_combo.addItems(["M5", "M15", "H1", "H4", "D1"])
         config_grid.addWidget(self.strategy_timeframe_combo, 1, 3)
 
         config_grid.addWidget(QLabel("Builder:"), 2, 0)
         self.builder_mode_combo = QComboBox(config_card)
         self.builder_mode_combo.setObjectName("StrategyBuilderModeSelector")
+        self.builder_mode_combo.setMinimumHeight(30)
         self.builder_mode_combo.addItems(["Visual Rules", "Python Code"])
         config_grid.addWidget(self.builder_mode_combo, 2, 1)
 
         config_grid.addWidget(QLabel("Strategy ID:"), 2, 2)
         self.strategy_id_input = QLineEdit(config_card)
         self.strategy_id_input.setObjectName("StrategyIdInput")
+        self.strategy_id_input.setMinimumHeight(30)
         self.strategy_id_input.setPlaceholderText("optional-slug")
         config_grid.addWidget(self.strategy_id_input, 2, 3)
 
         config_grid.addWidget(QLabel("Python module:"), 3, 0)
         self.module_path_input = QLineEdit(config_card)
         self.module_path_input.setObjectName("StrategyModulePathInput")
+        self.module_path_input.setMinimumHeight(30)
         self.module_path_input.setPlaceholderText("strategies/my_strategy.py")
         config_grid.addWidget(self.module_path_input, 3, 1)
 
         config_grid.addWidget(QLabel("Class:"), 3, 2)
         self.class_name_input = QLineEdit(config_card)
         self.class_name_input.setObjectName("StrategyClassNameInput")
+        self.class_name_input.setMinimumHeight(30)
         self.class_name_input.setPlaceholderText("MyStrategy")
         config_grid.addWidget(self.class_name_input, 3, 3)
 
@@ -1056,14 +1067,16 @@ class BotStrategyLabPanel(QWidget):
         self.ai_rationale_view = QTextEdit(ai_card)
         self.ai_rationale_view.setObjectName("LocalAiRationaleView")
         self.ai_rationale_view.setReadOnly(True)
-        self.ai_rationale_view.setMaximumHeight(58)
+        self.ai_rationale_view.setMinimumHeight(54)
+        self.ai_rationale_view.setMaximumHeight(74)
         self.ai_rationale_view.setPlainText("No local AI analysis received.")
         ai_layout.addWidget(self.ai_rationale_view)
 
         self.ai_proposals_view = QTextEdit(ai_card)
         self.ai_proposals_view.setObjectName("LocalAiProposalsView")
         self.ai_proposals_view.setReadOnly(True)
-        self.ai_proposals_view.setMaximumHeight(62)
+        self.ai_proposals_view.setMinimumHeight(54)
+        self.ai_proposals_view.setMaximumHeight(74)
         self.ai_proposals_view.setPlaceholderText("Research-only bot proposals will appear here.")
         ai_layout.addWidget(self.ai_proposals_view)
 
@@ -1231,11 +1244,12 @@ class BotStrategyLabPanel(QWidget):
         )
         backtest_layout.addWidget(self.backtester_output, stretch=1)
 
-        self.lab_tabs.addTab(strategy_tab, "Strategy Lab")
+        strategy_scroll.setWidget(strategy_tab)
+        self.lab_tabs.addTab(strategy_scroll, "Strategy Lab")
         self.lab_tabs.addTab(backtester_tab, "Backtester")
-        self.strategy_tab = strategy_tab
+        self.strategy_tab = strategy_scroll
         self.backtester_tab = backtester_tab
-        self.strategy_lab_tab = strategy_tab
+        self.strategy_lab_tab = strategy_scroll
         self.backtest_tab = backtester_tab
         layout.addWidget(self.lab_tabs, stretch=1)
 
