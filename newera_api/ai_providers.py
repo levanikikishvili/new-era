@@ -47,6 +47,12 @@ DEFAULT_GEMINI_MODELS: tuple[str, ...] = (
     "gemini-flash-latest",
 )
 
+DEFAULT_GROK_MODELS: tuple[str, ...] = (
+    "grok-4.6",
+    "grok-3",
+    "grok-2-latest",
+)
+
 DEFAULT_LOCAL_OLLAMA_MODEL = "deepseek-r1:8b"
 DEFAULT_LOCAL_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/generate"
 
@@ -297,6 +303,31 @@ class OpenAIProvider(AIProvider):
             ok=False,
             error=redact_secrets(self.last_error or "OpenAI request failed"),
         )
+
+
+class GrokXAIProvider(OpenAIProvider):
+    """xAI Grok Provider (`https://api.x.ai/v1/chat/completions`) for Grok Trading Bot & Sentiment."""
+
+    provider_id = "grok"
+    provider_name = "xAI Grok API"
+
+    def _get_api_key(self) -> str:
+        load_workspace_dotenv(self.root)
+        return (os.getenv("XAI_API_KEY") or os.getenv("GROK_API_KEY") or "").strip()
+
+    def _get_base_url(self) -> str:
+        load_workspace_dotenv(self.root)
+        raw = os.getenv("XAI_BASE_URL", "https://api.x.ai/v1").strip().rstrip("/")
+        return raw or "https://api.x.ai/v1"
+
+    def model_candidates(self) -> list[str]:
+        load_workspace_dotenv(self.root)
+        env_model = (os.getenv("XAI_MODEL") or os.getenv("GROK_MODEL") or "").strip()
+        ordered: list[str] = []
+        for candidate in (env_model, self.active_model, *DEFAULT_GROK_MODELS):
+            if candidate and candidate not in ordered and candidate not in self._dead_models:
+                ordered.append(candidate)
+        return ordered or list(DEFAULT_GROK_MODELS)
 
 
 class GeminiProvider(AIProvider):
@@ -610,9 +641,12 @@ class AIProviderRouter:
         self.root = root
         load_workspace_dotenv(self.root)
         env_primary = os.getenv("NEWERA_AI_PROVIDER", "openai").strip().lower()
-        self.primary_provider_id: str = env_primary if env_primary in {"openai", "gemini", "local_ollama"} else "openai"
+        self.primary_provider_id: str = (
+            env_primary if env_primary in {"openai", "gemini", "grok", "local_ollama"} else "openai"
+        )
         self.openai = OpenAIProvider(root=root, enabled=True)
         self.gemini = GeminiProvider(root=root, enabled=True)
+        self.grok = GrokXAIProvider(root=root, enabled=True)
         local_opt_in = os.getenv("NEWERA_LOCAL_AI_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
         self.local_ollama = LocalOllamaProvider(enabled=local_opt_in)
 
@@ -622,6 +656,8 @@ class AIProviderRouter:
             return self.openai
         if norm == "gemini":
             return self.gemini
+        if norm in {"grok", "xai"}:
+            return self.grok
         if norm in {"local_ollama", "ollama", "local"}:
             return self.local_ollama
         return None
@@ -630,13 +666,14 @@ class AIProviderRouter:
         all_map: dict[str, AIProvider] = {
             "openai": self.openai,
             "gemini": self.gemini,
+            "grok": self.grok,
             "local_ollama": self.local_ollama,
         }
         ordered: list[AIProvider] = []
         primary = all_map.get(self.primary_provider_id)
         if primary is not None:
             ordered.append(primary)
-        for pid in ("openai", "gemini", "local_ollama"):
+        for pid in ("openai", "grok", "gemini", "local_ollama"):
             prov = all_map[pid]
             if prov not in ordered:
                 ordered.append(prov)
@@ -661,11 +698,15 @@ class AIProviderRouter:
     def status_snapshot(self) -> dict[str, Any]:
         openai_st = self.openai.status_snapshot()
         gemini_st = self.gemini.status_snapshot()
+        grok_st = self.grok.status_snapshot()
         ollama_st = self.local_ollama.status_snapshot()
-        any_cloud_configured = bool(openai_st["configured"] or gemini_st["configured"])
+        any_cloud_configured = bool(openai_st["configured"] or gemini_st["configured"] or grok_st["configured"])
         active_prov = self.primary_provider_id
-        if active_prov == "openai" and not openai_st["configured"] and gemini_st["configured"]:
-            active_prov = "gemini"
+        if active_prov == "openai" and not openai_st["configured"]:
+            if grok_st["configured"]:
+                active_prov = "grok"
+            elif gemini_st["configured"]:
+                active_prov = "gemini"
         return {
             "primary_provider": self.primary_provider_id,
             "effective_provider": active_prov if any_cloud_configured else "deterministic_quant_fallback",
@@ -675,6 +716,7 @@ class AIProviderRouter:
             "providers": {
                 "openai": openai_st,
                 "gemini": gemini_st,
+                "grok": grok_st,
                 "local_ollama": ollama_st,
                 "deterministic_quant": {
                     "provider_id": "deterministic_quant",

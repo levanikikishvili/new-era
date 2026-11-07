@@ -19,6 +19,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 import urllib.request
@@ -70,14 +71,18 @@ SCREENER_SYMBOLS: tuple[str, ...] = (
     "EURUSD",
     "GBPUSD",
     "USDJPY",
+    "AUDUSD",
+    "USDCAD",
+    "USDCHF",
+    "NZDUSD",
+    "USTEC",
+    "US500",
     "BTCUSD",
     "ETHUSD",
-    "US500",
-    "USTEC",
 )
 AUTO_SCREENER_MIN_WIN_PROB: float = 68.0
 AUTO_SCREENER_INTERVAL_SECONDS: int = 15
-JOEY_LIVE_AUTO_EXECUTION_SYMBOLS: frozenset[str] = frozenset({"XAUUSD", "USTEC", "US500"})
+JOEY_LIVE_AUTO_EXECUTION_SYMBOLS: frozenset[str] = frozenset(SCREENER_SYMBOLS)
 
 
 def is_joey_live_auto_execution_symbol(symbol: str) -> bool:
@@ -1724,6 +1729,7 @@ class Orchestrator:
                 cwd=str(self.settings.root),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except OSError as exc:
             await self._publish(event("process.failed", scan_id=job.scan_id, source=source, error=str(exc)), job)

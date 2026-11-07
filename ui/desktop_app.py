@@ -628,8 +628,50 @@ QScrollArea {
     background-color: transparent;
 }
 
+QScrollBar:vertical {
+    background: #060911;
+    width: 7px;
+    margin: 0px;
+    border-radius: 3px;
+}
+
+QScrollBar::handle:vertical {
+    background: #1e2d45;
+    min-height: 26px;
+    border-radius: 3px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: #38bdf8;
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+
+QScrollBar:horizontal {
+    background: #060911;
+    height: 7px;
+    margin: 0px;
+    border-radius: 3px;
+}
+
+QScrollBar::handle:horizontal {
+    background: #1e2d45;
+    min-width: 26px;
+    border-radius: 3px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background: #38bdf8;
+}
+
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    width: 0px;
+}
+
 QSplitter::handle {
-    background-color: #1e293b;
+    background-color: #131d31;
 }
 
 QSplitter::handle:horizontal {
@@ -1076,14 +1118,16 @@ class NewEraDesktopTerminal(QMainWindow):
         central = QWidget(self)
         self.setCentralWidget(central)
         root_layout = QVBoxLayout(central)
-        root_layout.setContentsMargins(10, 8, 10, 6)
-        root_layout.setSpacing(6)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
 
-        # 1. Header Panel (System Status + Hero Gate Banner + Live MT5 Account Telemetry + Live Floating PnL)
-        root_layout.addWidget(self._build_header_panel())
+        # 1. Classic Header Panel (kept alive for telemetry contract; hidden by default for single-header Obsidian clarity)
+        self.header_panel_frame = self._build_header_panel()
+        self.header_panel_frame.hide()
+        root_layout.addWidget(self.header_panel_frame)
 
-        # 2. Control & Symbol Bar (Dynamic MT5 Symbols + One-Click/Auto Demo Execution + Scan Actions)
-        root_layout.addWidget(self._build_control_panel())
+        # 2. Control & Symbol Bar (embedded cleanly inside 02 Trading Terminal above the TradingView Chart)
+        self.control_panel_frame = self._build_control_panel()
 
         # 3. Phase 2 surfaces remain the source of truth, but Phase 3 hosts
         # each surface in a native, independently movable QDockWidget.
@@ -1113,10 +1157,18 @@ class NewEraDesktopTerminal(QMainWindow):
         phase2_widgets = self.phase2_tabs.detach_tabs_for_docks()
         self._build_phase3_docks(phase2_widgets)
 
+        # Compose 02 Trading Terminal surface with Control Bar + Live Chart/Execution Workspace
+        trading_terminal_surface = QWidget(central)
+        tt_lay = QVBoxLayout(trading_terminal_surface)
+        tt_lay.setContentsMargins(0, 0, 0, 0)
+        tt_lay.setSpacing(6)
+        tt_lay.addWidget(self.control_panel_frame)
+        tt_lay.addWidget(phase2_widgets[0], stretch=1)
+
         # New Era 2.0 Unified Single-Window Workspace Shell (Collapsible Left Sidebar + 13 Main Sections)
         self.workspace_shell = NewEra2WorkspaceShell(
             root=WORKSPACE_ROOT,
-            trading_terminal_widget=phase2_widgets[0],
+            trading_terminal_widget=trading_terminal_surface,
             strategy_lab_widget=self.strategy_lab_panel,
             quant_controls_widget=phase2_widgets[1],
             bot_fleet_widget=phase2_widgets[2],
@@ -1893,20 +1945,20 @@ class NewEraDesktopTerminal(QMainWindow):
         self.auto_interval_spin.setSuffix("m")
         self.auto_interval_spin.setMinimumWidth(54)
 
-        # Scan Action Buttons
-        self.btn_manual_scan = QPushButton("▶ SCAN SYMBOL (MT5 → AI)", panel)
+        # Scan Action Buttons (Concise labels so zero clipping occurs on any DPI)
+        self.btn_manual_scan = QPushButton("▶ SCAN AI", panel)
         self.btn_manual_scan.setObjectName("PrimaryScanButton")
         self.btn_manual_scan.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_manual_scan.clicked.connect(self.trigger_manual_scan)
 
-        self.btn_run_screener = QPushButton("🔎 SCAN TOP 8 PAIRS", panel)
+        self.btn_run_screener = QPushButton("🔎 TOP 8", panel)
         self.btn_run_screener.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_run_screener.setToolTip(
             "Run 4-Step Waterfall Screener across Top 8 pairs (XAUUSD, EURUSD, GBPUSD, USDJPY, BTCUSD, ETHUSD, US500, USTEC)"
         )
         self.btn_run_screener.clicked.connect(self.trigger_multi_pair_screener)
 
-        self.btn_auto_scan = QPushButton("⟳ AUTO-SCAN: OFF", panel)
+        self.btn_auto_scan = QPushButton("⟳ AUTO: OFF", panel)
         self.btn_auto_scan.setObjectName("AutoScanButton")
         self.btn_auto_scan.setCheckable(True)
         self.btn_auto_scan.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1918,7 +1970,7 @@ class NewEraDesktopTerminal(QMainWindow):
         self.demo_side_combo.setMinimumWidth(98)
         self.demo_side_combo.setToolTip("Select order direction for Demo Execution (AI GATE uses AI signal)")
 
-        self.btn_execute_demo = QPushButton("⚡ EXECUTE DEMO TRADE", panel)
+        self.btn_execute_demo = QPushButton("⚡ EXECUTE DEMO", panel)
         self.btn_execute_demo.setObjectName("ExecuteDemoButton")
         self.btn_execute_demo.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_execute_demo.setToolTip(
@@ -1926,7 +1978,7 @@ class NewEraDesktopTerminal(QMainWindow):
         )
         self.btn_execute_demo.clicked.connect(self.trigger_execute_demo_trade)
 
-        self.btn_auto_execute_demo = QPushButton("🤖 AUTO-EXEC DEMO: OFF", panel)
+        self.btn_auto_execute_demo = QPushButton("🤖 AUTO-EXEC: OFF", panel)
         self.btn_auto_execute_demo.setObjectName("AutoExecDemoButton")
         self.btn_auto_execute_demo.setCheckable(True)
         self.btn_auto_execute_demo.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1935,7 +1987,7 @@ class NewEraDesktopTerminal(QMainWindow):
         )
         self.btn_auto_execute_demo.toggled.connect(self.on_toggle_auto_execute_demo)
 
-        self.btn_close_demo = QPushButton("✖ CLOSE DEMO", panel)
+        self.btn_close_demo = QPushButton("✖ CLOSE", panel)
         self.btn_close_demo.setObjectName("CloseDemoButton")
         self.btn_close_demo.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_close_demo.setToolTip("Close open Demo position(s) for active symbol")

@@ -487,6 +487,7 @@ def find_mt5_python() -> str | None:
                     text=True,
                     timeout=3,
                     check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
                 if proc.returncode == 0 and proc.stdout.strip():
                     return proc.stdout.strip()
@@ -2281,6 +2282,11 @@ def _call_bridge_cli(args: list[str], timeout: float = 15.0) -> dict[str, Any]:
         raise RuntimeError(
             "MetaTrader5 Python environment not found. Install MetaTrader5 in Python 3.11-3.14."
         )
+    sinfo = None
+    if hasattr(subprocess, "STARTUPINFO"):
+        sinfo = subprocess.STARTUPINFO()
+        sinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
+        sinfo.wShowWindow = 0
     proc = subprocess.run(
         [mt5_py, str(Path(__file__).resolve()), *args],
         capture_output=True,
@@ -2289,6 +2295,8 @@ def _call_bridge_cli(args: list[str], timeout: float = 15.0) -> dict[str, Any]:
         errors="replace",
         timeout=timeout,
         check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        startupinfo=sinfo,
     )
     if proc.returncode != 0:
         err_msg = proc.stderr.strip() or proc.stdout.strip() or f"exit code {proc.returncode}"
